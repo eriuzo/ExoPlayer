@@ -25,7 +25,7 @@ import android.view.Choreographer.FrameCallback;
  * Makes a best effort to adjust frame release timestamps for a smoother visual result.
  */
 @TargetApi(16)
-public class SmoothFrameReleaseTimeHelper implements FrameReleaseTimeHelper, FrameCallback {
+public final class SmoothFrameReleaseTimeHelper implements FrameReleaseTimeHelper, FrameCallback {
 
   private static final long CHOREOGRAPHER_SAMPLE_DELAY_MILLIS = 500;
   private static final long MAX_ALLOWED_DRIFT_NS = 20000000;
@@ -107,7 +107,7 @@ public class SmoothFrameReleaseTimeHelper implements FrameReleaseTimeHelper, Fra
       if (frameCount >= MIN_FRAMES_FOR_ADJUSTMENT) {
         // We're synced and have waited the required number of frames to apply an adjustment.
         // Calculate the average frame time across all the frames we've seen since the last sync.
-        // This will typically give us a framerate at a finer granularity than the frame times
+        // This will typically give us a frame rate at a finer granularity than the frame times
         // themselves (which often only have millisecond granularity).
         long averageFrameTimeNs = (unadjustedFrameTimeNs - syncFrameTimeNs) / frameCount;
         // Project the adjusted frame time forward using the average.

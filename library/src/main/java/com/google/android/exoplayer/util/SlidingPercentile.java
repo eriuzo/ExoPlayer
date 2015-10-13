@@ -31,7 +31,7 @@ import java.util.Comparator;
  * @see <a href="http://en.wikipedia.org/wiki/Moving_average">Wiki: Moving average</a>
  * @see <a href="http://en.wikipedia.org/wiki/Selection_algorithm">Wiki: Selection algorithm</a>
  */
-public class SlidingPercentile {
+public final class SlidingPercentile {
 
   // Orderings.
   private static final Comparator<Sample> INDEX_COMPARATOR = new Comparator<Sample>() {
@@ -67,7 +67,7 @@ public class SlidingPercentile {
   public SlidingPercentile(int maxWeight) {
     this.maxWeight = maxWeight;
     recycledSamples = new Sample[MAX_RECYCLED_SAMPLES];
-    samples = new ArrayList<Sample>();
+    samples = new ArrayList<>();
     currentSortOrder = SORT_ORDER_NONE;
   }
 

@@ -17,11 +17,9 @@ package com.google.android.exoplayer.chunk;
 
 import com.google.android.exoplayer.C;
 import com.google.android.exoplayer.MediaFormat;
-import com.google.android.exoplayer.TrackInfo;
 import com.google.android.exoplayer.upstream.DataSource;
 import com.google.android.exoplayer.upstream.DataSpec;
 
-import java.io.IOException;
 import java.util.List;
 
 /**
@@ -30,21 +28,21 @@ import java.util.List;
  * An example use case for this implementation is to act as the source for loading out-of-band
  * subtitles, where subtitles for the entire video are delivered as a single file.
  */
-public class SingleSampleChunkSource implements ChunkSource {
+public final class SingleSampleChunkSource implements ChunkSource {
 
   private final DataSource dataSource;
   private final DataSpec dataSpec;
   private final Format format;
   private final long durationUs;
   private final MediaFormat mediaFormat;
-  private final TrackInfo trackInfo;
 
   /**
    * @param dataSource A {@link DataSource} suitable for loading the sample data.
    * @param dataSpec Defines the location of the sample.
    * @param format The format of the sample.
    * @param durationUs The duration of the sample in microseconds, or {@link C#UNKNOWN_TIME_US} if
-   *     the duration is unknown.
+   *     the duration is unknown, or {@link C#MATCH_LONGEST_US} if the duration should match the
+   *     duration of the longest track whose duration is known.
    * @param mediaFormat The sample media format. May be null.
    */
   public SingleSampleChunkSource(DataSource dataSource, DataSpec dataSpec, Format format,
@@ -54,21 +52,25 @@ public class SingleSampleChunkSource implements ChunkSource {
     this.format = format;
     this.durationUs = durationUs;
     this.mediaFormat = mediaFormat;
-    trackInfo = new TrackInfo(format.mimeType, durationUs);
   }
 
   @Override
-  public TrackInfo getTrackInfo() {
-    return trackInfo;
+  public boolean prepare() {
+    return true;
   }
 
   @Override
-  public void getMaxVideoDimensions(MediaFormat out) {
-    // Do nothing.
+  public int getTrackCount() {
+    return 1;
   }
 
   @Override
-  public void enable() {
+  public MediaFormat getFormat(int track) {
+    return mediaFormat;
+  }
+
+  @Override
+  public void enable(int track) {
     // Do nothing.
   }
 
@@ -82,6 +84,7 @@ public class SingleSampleChunkSource implements ChunkSource {
       long playbackPositionUs, ChunkOperationHolder out) {
     if (!queue.isEmpty()) {
       // We've already provided the single sample.
+      out.endOfStream = true;
       return;
     }
     out.chunk = initChunk();
@@ -93,8 +96,13 @@ public class SingleSampleChunkSource implements ChunkSource {
   }
 
   @Override
-  public IOException getError() {
-    return null;
+  public void maybeThrowError() {
+    // Do nothing.
+  }
+
+  @Override
+  public void onChunkLoadCompleted(Chunk chunk) {
+    // Do nothing.
   }
 
   @Override
@@ -103,8 +111,8 @@ public class SingleSampleChunkSource implements ChunkSource {
   }
 
   private SingleSampleMediaChunk initChunk() {
-    return new SingleSampleMediaChunk(dataSource, dataSpec, format, 0, 0, durationUs, -1,
-        mediaFormat);
+    return new SingleSampleMediaChunk(dataSource, dataSpec, Chunk.TRIGGER_UNSPECIFIED, format, 0,
+        durationUs, 0, mediaFormat, null, Chunk.NO_PARENT_ID);
   }
 
 }

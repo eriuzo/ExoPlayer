@@ -19,6 +19,7 @@ import com.google.android.exoplayer.C;
 import com.google.android.exoplayer.upstream.DataSink;
 import com.google.android.exoplayer.upstream.DataSpec;
 import com.google.android.exoplayer.util.Assertions;
+import com.google.android.exoplayer.util.Util;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -28,7 +29,7 @@ import java.io.IOException;
 /**
  * Writes data into a cache.
  */
-public class CacheDataSink implements DataSink {
+public final class CacheDataSink implements DataSink {
 
   private final Cache cache;
   private final long maxCacheFileSize;
@@ -115,11 +116,23 @@ public class CacheDataSink implements DataSink {
   }
 
   private void closeCurrentOutputStream() throws IOException {
-    if (outputStream != null) {
+    if (outputStream == null) {
+      return;
+    }
+
+    boolean success = false;
+    try {
       outputStream.flush();
-      outputStream.close();
+      outputStream.getFD().sync();
+      success = true;
+    } finally {
+      Util.closeQuietly(outputStream);
+      if (success) {
+        cache.commitFile(file);
+      } else {
+        file.delete();
+      }
       outputStream = null;
-      cache.commitFile(file);
       file = null;
     }
   }

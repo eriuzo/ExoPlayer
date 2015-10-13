@@ -18,7 +18,7 @@ package com.google.android.exoplayer.dash.mpd;
 /**
  * Represents a UTCTiming element.
  */
-public class UtcTimingElement {
+public final class UtcTimingElement {
 
   public final String schemeIdUri;
   public final String value;
@@ -26,6 +26,11 @@ public class UtcTimingElement {
   public UtcTimingElement(String schemeIdUri, String value) {
     this.schemeIdUri = schemeIdUri;
     this.value = value;
+  }
+
+  @Override
+  public String toString() {
+    return schemeIdUri + ", " + value;
   }
 
 }

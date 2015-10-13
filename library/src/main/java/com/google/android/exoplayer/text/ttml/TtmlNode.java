@@ -15,9 +15,12 @@
  */
 package com.google.android.exoplayer.text.ttml;
 
+import android.text.SpannableStringBuilder;
+
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeSet;
 
 /**
@@ -26,7 +29,6 @@ import java.util.TreeSet;
 /* package */ final class TtmlNode {
 
   public static final long UNDEFINED_TIME = -1;
-
   public static final String TAG_TT = "tt";
   public static final String TAG_HEAD = "head";
   public static final String TAG_BODY = "body";
@@ -43,25 +45,57 @@ import java.util.TreeSet;
   public static final String TAG_SMPTE_DATA = "smpte:data";
   public static final String TAG_SMPTE_INFORMATION = "smpte:information";
 
+  public static final String ATTR_ID = "id";
+  public static final String ATTR_TTS_BACKGROUND_COLOR = "backgroundColor";
+  public static final String ATTR_TTS_FONT_STYLE = "fontStyle";
+  public static final String ATTR_TTS_FONT_SIZE = "fontSize";
+  public static final String ATTR_TTS_FONT_FAMILY = "fontFamily";
+  public static final String ATTR_TTS_FONT_WEIGHT = "fontWeight";
+  public static final String ATTR_TTS_COLOR = "color";
+  public static final String ATTR_TTS_TEXT_DECORATION = "textDecoration";
+  public static final String ATTR_TTS_TEXT_ALIGN = "textAlign";
+
+  public static final String LINETHROUGH = "linethrough";
+  public static final String NO_LINETHROUGH = "nolinethrough";
+  public static final String UNDERLINE = "underline";
+  public static final String NO_UNDERLINE = "nounderline";
+  public static final String ITALIC = "italic";
+  public static final String BOLD = "bold";
+
+  public static final String LEFT = "left";
+  public static final String CENTER = "center";
+  public static final String RIGHT = "right";
+  public static final String START = "start";
+  public static final String END = "end";
+
   public final String tag;
-  public final boolean isTextNode;
   public final String text;
+  public final boolean isTextNode;
   public final long startTimeUs;
   public final long endTimeUs;
+  public final TtmlStyle style;
+  private String[] styleIds;
 
   private List<TtmlNode> children;
+  private int start;
+  private int end;
 
   public static TtmlNode buildTextNode(String text) {
-    return new TtmlNode(null, applySpacePolicy(text, true), UNDEFINED_TIME, UNDEFINED_TIME);
+    return new TtmlNode(null, TtmlRenderUtil.applyTextElementSpacePolicy(text), UNDEFINED_TIME,
+        UNDEFINED_TIME, null, null);
   }
 
-  public static TtmlNode buildNode(String tag, long startTimeUs, long endTimeUs) {
-    return new TtmlNode(tag, null, startTimeUs, endTimeUs);
+  public static TtmlNode buildNode(String tag, long startTimeUs, long endTimeUs,
+      TtmlStyle style, String[] styleIds) {
+    return new TtmlNode(tag, null, startTimeUs, endTimeUs, style, styleIds);
   }
 
-  private TtmlNode(String tag, String text, long startTimeUs, long endTimeUs) {
+  private TtmlNode(String tag, String text, long startTimeUs, long endTimeUs,
+      TtmlStyle style, String[] styleIds) {
     this.tag = tag;
     this.text = text;
+    this.style = style;
+    this.styleIds = styleIds;
     this.isTextNode = text != null;
     this.startTimeUs = startTimeUs;
     this.endTimeUs = endTimeUs;
@@ -76,7 +110,7 @@ import java.util.TreeSet;
 
   public void addChild(TtmlNode child) {
     if (children == null) {
-      children = new ArrayList<TtmlNode>();
+      children = new ArrayList<>();
     }
     children.add(child);
   }
@@ -93,7 +127,7 @@ import java.util.TreeSet;
   }
 
   public long[] getEventTimesUs() {
-    TreeSet<Long> eventTimeSet = new TreeSet<Long>();
+    TreeSet<Long> eventTimeSet = new TreeSet<>();
     getEventTimes(eventTimeSet, false);
     long[] eventTimes = new long[eventTimeSet.size()];
     Iterator<Long> eventTimeIterator = eventTimeSet.iterator();
@@ -123,50 +157,95 @@ import java.util.TreeSet;
     }
   }
 
-  public String getText(long timeUs) {
-    StringBuilder builder = new StringBuilder();
-    getText(timeUs, builder, false);
-    return applySpacePolicy(builder.toString().replaceAll("\n$", ""), false);
+  public String[] getStyleIds() {
+    return styleIds;
   }
 
-  private void getText(long timeUs, StringBuilder builder, boolean descendsPNode) {
+  public CharSequence getText(long timeUs, Map<String, TtmlStyle> globalStyles) {
+    SpannableStringBuilder builder = new SpannableStringBuilder();
+    traverseForText(timeUs, builder, false);
+    traverseForStyle(builder, globalStyles);
+    // Having joined the text elements, we need to do some final cleanup on the result.
+    // 1. Collapse multiple consecutive spaces into a single space.
+    int builderLength = builder.length();
+    for (int i = 0; i < builderLength; i++) {
+      if (builder.charAt(i) == ' ') {
+        int j = i + 1;
+        while (j < builder.length() && builder.charAt(j) == ' ') {
+          j++;
+        }
+        int spacesToDelete = j - (i + 1);
+        if (spacesToDelete > 0) {
+          builder.delete(i, i + spacesToDelete);
+          builderLength -= spacesToDelete;
+        }
+      }
+    }
+    // 2. Remove any spaces from the start of each line.
+    if (builderLength > 0 && builder.charAt(0) == ' ') {
+      builder.delete(0, 1);
+      builderLength--;
+    }
+    for (int i = 0; i < builderLength - 1; i++) {
+      if (builder.charAt(i) == '\n' && builder.charAt(i + 1) == ' ') {
+        builder.delete(i + 1, i + 2);
+        builderLength--;
+      }
+    }
+    // 3. Remove any spaces from the end of each line.
+    if (builderLength > 0 && builder.charAt(builderLength - 1) == ' ') {
+      builder.delete(builderLength - 1, builderLength);
+      builderLength--;
+    }
+    for (int i = 0; i < builderLength - 1; i++) {
+      if (builder.charAt(i) == ' ' && builder.charAt(i + 1) == '\n') {
+        builder.delete(i, i + 1);
+        builderLength--;
+      }
+    }
+    // 4. Trim a trailing newline, if there is one.
+    if (builderLength > 0 && builder.charAt(builderLength - 1) == '\n') {
+      builder.delete(builderLength - 1, builderLength);
+      /*builderLength--;*/
+    }
+
+    return builder;
+  }
+
+  private SpannableStringBuilder traverseForText(long timeUs, SpannableStringBuilder builder,
+      boolean descendsPNode) {
+    start = builder.length();
+    end = start;
     if (isTextNode && descendsPNode) {
       builder.append(text);
     } else if (TAG_BR.equals(tag) && descendsPNode) {
-      builder.append("\n");
+      builder.append('\n');
     } else if (TAG_METADATA.equals(tag)) {
       // Do nothing.
     } else if (isActive(timeUs)) {
       boolean isPNode = TAG_P.equals(tag);
-      int length = builder.length();
       for (int i = 0; i < getChildCount(); ++i) {
-        getChild(i).getText(timeUs, builder, descendsPNode || isPNode);
+        getChild(i).traverseForText(timeUs, builder, descendsPNode || isPNode);
       }
-      if (isPNode && length != builder.length()) {
-        builder.append("\n");
+      if (isPNode) {
+        TtmlRenderUtil.endParagraph(builder);
       }
+      end = builder.length();
     }
+    return builder;
   }
 
-  /**
-   * Applies the space policy to the given string. See:
-   * <a href src="http://www.w3.org/TR/ttaf1-dfxp/#content-attribute-space">The default space
-   * policy</a>
-   *
-   * @param in A string to apply the policy.
-   * @param treatLineFeedAsSpace Whether to convert line feeds to spaces.
-   */
-  private static String applySpacePolicy(String in, boolean treatLineFeedAsSpace) {
-    // Removes carriage return followed by line feed. See: http://www.w3.org/TR/xml/#sec-line-ends
-    String out = in.replaceAll("\r\n", "\n");
-    // Apply suppress-at-line-break="auto" and
-    // white-space-treatment="ignore-if-surrounding-linefeed"
-    out = out.replaceAll(" *\n *", "\n");
-    // Apply linefeed-treatment="treat-as-space"
-    out = treatLineFeedAsSpace ? out.replaceAll("\n", " ") : out;
-    // Apply white-space-collapse="true"
-    out = out.replaceAll("[ \t\\x0B\f\r]+", " ");
-    return out;
+  private void traverseForStyle(SpannableStringBuilder builder,
+      Map<String, TtmlStyle> globalStyles) {
+    if (start != end) {
+      TtmlStyle resolvedStyle = TtmlRenderUtil.resolveStyle(style, styleIds, globalStyles);
+      if (resolvedStyle != null) {
+        TtmlRenderUtil.applyStylesToSpan(builder, start, end, resolvedStyle);
+      }
+      for (int i = 0; i < getChildCount(); ++i) {
+        getChild(i).traverseForStyle(builder, globalStyles);
+      }
+    }
   }
 
 }

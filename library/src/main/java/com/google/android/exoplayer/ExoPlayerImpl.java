@@ -21,6 +21,7 @@ import android.os.Looper;
 import android.os.Message;
 import android.util.Log;
 
+import java.util.Arrays;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 /**
@@ -33,7 +34,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
   private final Handler eventHandler;
   private final ExoPlayerImplInternal internalPlayer;
   private final CopyOnWriteArraySet<Listener> listeners;
-  private final boolean[] rendererEnabledFlags;
+  private final MediaFormat[][] trackFormats;
+  private final int[] selectedTrackIndices;
 
   private boolean playWhenReady;
   private int playbackState;
@@ -55,18 +57,16 @@ import java.util.concurrent.CopyOnWriteArraySet;
     Log.i(TAG, "Init " + ExoPlayerLibraryInfo.VERSION);
     this.playWhenReady = false;
     this.playbackState = STATE_IDLE;
-    this.listeners = new CopyOnWriteArraySet<Listener>();
-    this.rendererEnabledFlags = new boolean[rendererCount];
-    for (int i = 0; i < rendererEnabledFlags.length; i++) {
-      rendererEnabledFlags[i] = true;
-    }
+    this.listeners = new CopyOnWriteArraySet<>();
+    this.trackFormats = new MediaFormat[rendererCount][];
+    this.selectedTrackIndices = new int[rendererCount];
     eventHandler = new Handler() {
       @Override
       public void handleMessage(Message msg) {
         ExoPlayerImpl.this.handleEvent(msg);
       }
     };
-    internalPlayer = new ExoPlayerImplInternal(eventHandler, playWhenReady, rendererEnabledFlags,
+    internalPlayer = new ExoPlayerImplInternal(eventHandler, playWhenReady, selectedTrackIndices,
         minBufferMs, minRebufferMs);
   }
 
@@ -92,20 +92,49 @@ import java.util.concurrent.CopyOnWriteArraySet;
 
   @Override
   public void prepare(TrackRenderer... renderers) {
+    Arrays.fill(trackFormats, null);
     internalPlayer.prepare(renderers);
   }
 
+  @Deprecated
   @Override
-  public void setRendererEnabled(int index, boolean enabled) {
-    if (rendererEnabledFlags[index] != enabled) {
-      rendererEnabledFlags[index] = enabled;
-      internalPlayer.setRendererEnabled(index, enabled);
+  public boolean getRendererHasMedia(int rendererIndex) {
+    return getTrackCount(rendererIndex) > 0;
+  }
+
+  @Deprecated
+  @Override
+  public void setRendererEnabled(int rendererIndex, boolean enabled) {
+    setSelectedTrack(rendererIndex, enabled ? ExoPlayer.TRACK_DEFAULT : ExoPlayer.TRACK_DISABLED);
+  }
+
+  @Deprecated
+  @Override
+  public boolean getRendererEnabled(int rendererIndex) {
+    return getSelectedTrack(rendererIndex) >= 0;
+  }
+
+  @Override
+  public int getTrackCount(int rendererIndex) {
+    return trackFormats[rendererIndex] != null ? trackFormats[rendererIndex].length : 0;
+  }
+
+  @Override
+  public MediaFormat getTrackFormat(int rendererIndex, int trackIndex) {
+    return trackFormats[rendererIndex][trackIndex];
+  }
+
+  @Override
+  public void setSelectedTrack(int rendererIndex, int trackIndex) {
+    if (selectedTrackIndices[rendererIndex] != trackIndex) {
+      selectedTrackIndices[rendererIndex] = trackIndex;
+      internalPlayer.setRendererSelectedTrack(rendererIndex, trackIndex);
     }
   }
 
   @Override
-  public boolean getRendererEnabled(int index) {
-    return rendererEnabledFlags[index];
+  public int getSelectedTrack(int rendererIndex) {
+    return selectedTrackIndices[rendererIndex];
   }
 
   @Override
@@ -182,6 +211,14 @@ import java.util.concurrent.CopyOnWriteArraySet;
   // Not private so it can be called from an inner class without going through a thunk method.
   /* package */ void handleEvent(Message msg) {
     switch (msg.what) {
+      case ExoPlayerImplInternal.MSG_PREPARED: {
+        System.arraycopy(msg.obj, 0, trackFormats, 0, trackFormats.length);
+        playbackState = msg.arg1;
+        for (Listener listener : listeners) {
+          listener.onPlayerStateChanged(playWhenReady, playbackState);
+        }
+        break;
+      }
       case ExoPlayerImplInternal.MSG_STATE_CHANGED: {
         playbackState = msg.arg1;
         for (Listener listener : listeners) {

@@ -16,11 +16,13 @@
 package com.google.android.exoplayer.dash;
 
 import com.google.android.exoplayer.BehindLiveWindowException;
+import com.google.android.exoplayer.C;
 import com.google.android.exoplayer.MediaFormat;
-import com.google.android.exoplayer.ParserException;
-import com.google.android.exoplayer.TrackInfo;
-import com.google.android.exoplayer.TrackRenderer;
+import com.google.android.exoplayer.TimeRange;
+import com.google.android.exoplayer.TimeRange.DynamicTimeRange;
+import com.google.android.exoplayer.TimeRange.StaticTimeRange;
 import com.google.android.exoplayer.chunk.Chunk;
+import com.google.android.exoplayer.chunk.ChunkExtractorWrapper;
 import com.google.android.exoplayer.chunk.ChunkOperationHolder;
 import com.google.android.exoplayer.chunk.ChunkSource;
 import com.google.android.exoplayer.chunk.ContainerMediaChunk;
@@ -28,41 +30,67 @@ import com.google.android.exoplayer.chunk.Format;
 import com.google.android.exoplayer.chunk.Format.DecreasingBandwidthComparator;
 import com.google.android.exoplayer.chunk.FormatEvaluator;
 import com.google.android.exoplayer.chunk.FormatEvaluator.Evaluation;
+import com.google.android.exoplayer.chunk.InitializationChunk;
 import com.google.android.exoplayer.chunk.MediaChunk;
 import com.google.android.exoplayer.chunk.SingleSampleMediaChunk;
-import com.google.android.exoplayer.chunk.parser.Extractor;
-import com.google.android.exoplayer.chunk.parser.mp4.FragmentedMp4Extractor;
-import com.google.android.exoplayer.chunk.parser.webm.WebmExtractor;
+import com.google.android.exoplayer.dash.DashTrackSelector.Output;
 import com.google.android.exoplayer.dash.mpd.AdaptationSet;
 import com.google.android.exoplayer.dash.mpd.ContentProtection;
 import com.google.android.exoplayer.dash.mpd.MediaPresentationDescription;
 import com.google.android.exoplayer.dash.mpd.Period;
 import com.google.android.exoplayer.dash.mpd.RangedUri;
 import com.google.android.exoplayer.dash.mpd.Representation;
-import com.google.android.exoplayer.text.webvtt.WebvttParser;
+import com.google.android.exoplayer.drm.DrmInitData;
+import com.google.android.exoplayer.extractor.ChunkIndex;
+import com.google.android.exoplayer.extractor.mp4.FragmentedMp4Extractor;
+import com.google.android.exoplayer.extractor.webm.WebmExtractor;
 import com.google.android.exoplayer.upstream.DataSource;
 import com.google.android.exoplayer.upstream.DataSpec;
-import com.google.android.exoplayer.upstream.NonBlockingInputStream;
+import com.google.android.exoplayer.util.Clock;
 import com.google.android.exoplayer.util.ManifestFetcher;
 import com.google.android.exoplayer.util.MimeTypes;
+import com.google.android.exoplayer.util.SystemClock;
 
-import android.net.Uri;
-import android.os.SystemClock;
+import android.os.Handler;
+import android.text.TextUtils;
+import android.util.Log;
+import android.util.SparseArray;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.UUID;
 
 /**
  * An {@link ChunkSource} for DASH streams.
  * <p>
- * This implementation currently supports fMP4, webm, and webvtt.
+ * This implementation currently supports fMP4, webm, webvtt and ttml.
+ * <p>
+ * This implementation makes the following assumptions about multi-period manifests:
+ * <ol>
+ * <li>that new periods will contain the same representations as previous periods (i.e. no new or
+ * missing representations) and</li>
+ * <li>that representations are contiguous across multiple periods</li>
+ * </ol>
  */
-public class DashChunkSource implements ChunkSource {
+// TODO: handle cases where the above assumption are false
+public class DashChunkSource implements ChunkSource, Output {
+
+  /**
+   * Interface definition for a callback to be notified of {@link DashChunkSource} events.
+   */
+  public interface EventListener {
+
+    /**
+     * Invoked when the available seek range of the stream has changed.
+     *
+     * @param availableRange The range which specifies available content that can be seeked to.
+     */
+    public void onAvailableRangeChanged(TimeRange availableRange);
+
+  }
 
   /**
    * Thrown when an AdaptationSet is missing from the MPD.
@@ -75,31 +103,30 @@ public class DashChunkSource implements ChunkSource {
 
   }
 
-  /**
-   * Specifies that we should process all tracks.
-   */
-  public static final int USE_ALL_TRACKS = -1;
+  private static final String TAG = "DashChunkSource";
 
-  private final TrackInfo trackInfo;
+  private final Handler eventHandler;
+  private final EventListener eventListener;
+
   private final DataSource dataSource;
-  private final FormatEvaluator evaluator;
+  private final FormatEvaluator adaptiveFormatEvaluator;
   private final Evaluation evaluation;
-  private final StringBuilder headerBuilder;
-  private final long liveEdgeLatencyUs;
-  private final int maxWidth;
-  private final int maxHeight;
-
-  private final Format[] formats;
-  private final HashMap<String, RepresentationHolder> representationHolders;
-
   private final ManifestFetcher<MediaPresentationDescription> manifestFetcher;
-  private final int adaptationSetIndex;
-  private final int[] representationIndices;
-  private final Map<UUID, byte[]> psshInfo;
+  private final DashTrackSelector trackSelector;
+  private final ArrayList<ExposedTrack> tracks;
+  private final SparseArray<PeriodHolder> periodHolders;
+  private final Clock systemClock;
+  private final long liveEdgeLatencyUs;
+  private final long elapsedRealtimeOffsetUs;
+  private final long[] availableRangeValues;
+  private final boolean live;
 
   private MediaPresentationDescription currentManifest;
-  private boolean finishedCurrentManifest;
-
+  private ExposedTrack enabledTrack;
+  private int nextPeriodHolderIndex;
+  private TimeRange availableRange;
+  private boolean prepareCalled;
+  private boolean startAtLiveEdge;
   private boolean lastChunkWasInitialization;
   private IOException fatalError;
 
@@ -107,40 +134,49 @@ public class DashChunkSource implements ChunkSource {
    * Lightweight constructor to use for fixed duration content.
    *
    * @param dataSource A {@link DataSource} suitable for loading the media data.
-   * @param formatEvaluator Selects from the available formats.
+   * @param adaptiveFormatEvaluator For adaptive tracks, selects from the available formats.
+   * @param durationMs The duration of the content.
+   * @param adaptationSetType The type of the adaptation set to which the representations belong.
+   *     One of {@link AdaptationSet#TYPE_AUDIO}, {@link AdaptationSet#TYPE_VIDEO} and
+   *     {@link AdaptationSet#TYPE_TEXT}.
    * @param representations The representations to be considered by the source.
    */
-  public DashChunkSource(DataSource dataSource, FormatEvaluator formatEvaluator,
-      Representation... representations) {
-    this(buildManifest(Arrays.asList(representations)), 0, null, dataSource, formatEvaluator);
+  public DashChunkSource(DataSource dataSource, FormatEvaluator adaptiveFormatEvaluator,
+      long durationMs, int adaptationSetType, Representation... representations) {
+    this(dataSource, adaptiveFormatEvaluator, durationMs, adaptationSetType,
+        Arrays.asList(representations));
   }
 
   /**
    * Lightweight constructor to use for fixed duration content.
    *
    * @param dataSource A {@link DataSource} suitable for loading the media data.
-   * @param formatEvaluator Selects from the available formats.
+   * @param adaptiveFormatEvaluator For adaptive tracks, selects from the available formats.
+   * @param durationMs The duration of the content.
+   * @param adaptationSetType The type of the adaptation set to which the representations belong.
+   *     One of {@link AdaptationSet#TYPE_AUDIO}, {@link AdaptationSet#TYPE_VIDEO} and
+   *     {@link AdaptationSet#TYPE_TEXT}.
    * @param representations The representations to be considered by the source.
    */
-  public DashChunkSource(DataSource dataSource, FormatEvaluator formatEvaluator,
-      List<Representation> representations) {
-    this(buildManifest(representations), 0, null, dataSource, formatEvaluator);
+  public DashChunkSource(DataSource dataSource, FormatEvaluator adaptiveFormatEvaluator,
+      long durationMs, int adaptationSetType, List<Representation> representations) {
+    this(buildManifest(durationMs, adaptationSetType, representations),
+        DefaultDashTrackSelector.newVideoInstance(null, false, false), dataSource,
+        adaptiveFormatEvaluator);
   }
 
   /**
    * Constructor to use for fixed duration content.
    *
    * @param manifest The manifest.
-   * @param adaptationSetIndex The index of the adaptation set that should be used.
-   * @param representationIndices The indices of the representations within the adaptations set
-   *     that should be used. May be null if all representations within the adaptation set should
-   *     be considered.
+   * @param trackSelector Selects tracks from manifest periods to be exposed by this source.
    * @param dataSource A {@link DataSource} suitable for loading the media data.
-   * @param formatEvaluator Selects from the available formats.
+   * @param adaptiveFormatEvaluator For adaptive tracks, selects from the available formats.
    */
-  public DashChunkSource(MediaPresentationDescription manifest, int adaptationSetIndex,
-      int[] representationIndices, DataSource dataSource, FormatEvaluator formatEvaluator) {
-    this(null, manifest, adaptationSetIndex, representationIndices, dataSource, formatEvaluator, 0);
+  public DashChunkSource(MediaPresentationDescription manifest, DashTrackSelector trackSelector,
+      DataSource dataSource, FormatEvaluator adaptiveFormatEvaluator) {
+    this(null, manifest, trackSelector, dataSource, adaptiveFormatEvaluator, new SystemClock(), 0,
+        0, false, null, null);
   }
 
   /**
@@ -151,89 +187,129 @@ public class DashChunkSource implements ChunkSource {
    *
    * @param manifestFetcher A fetcher for the manifest, which must have already successfully
    *     completed an initial load.
-   * @param adaptationSetIndex The index of the adaptation set that should be used.
-   * @param representationIndices The indices of the representations within the adaptations set
-   *     that should be used. May be null if all representations within the adaptation set should
-   *     be considered.
+   * @param trackSelector Selects tracks from manifest periods to be exposed by this source.
    * @param dataSource A {@link DataSource} suitable for loading the media data.
-   * @param formatEvaluator Selects from the available formats.
+   * @param adaptiveFormatEvaluator For adaptive tracks, selects from the available formats.
    * @param liveEdgeLatencyMs For live streams, the number of milliseconds that the playback should
    *     lag behind the "live edge" (i.e. the end of the most recently defined media in the
    *     manifest). Choosing a small value will minimize latency introduced by the player, however
    *     note that the value sets an upper bound on the length of media that the player can buffer.
    *     Hence a small value may increase the probability of rebuffering and playback failures.
+   * @param elapsedRealtimeOffsetMs If known, an estimate of the instantaneous difference between
+   *     server-side unix time and {@link SystemClock#elapsedRealtime()} in milliseconds, specified
+   *     as the server's unix time minus the local elapsed time. It unknown, set to 0.
+   * @param eventHandler A handler to use when delivering events to {@code EventListener}. May be
+   *     null if delivery of events is not required.
+   * @param eventListener A listener of events. May be null if delivery of events is not required.
    */
   public DashChunkSource(ManifestFetcher<MediaPresentationDescription> manifestFetcher,
-      int adaptationSetIndex, int[] representationIndices, DataSource dataSource,
-      FormatEvaluator formatEvaluator, long liveEdgeLatencyMs) {
-    this(manifestFetcher, manifestFetcher.getManifest(), adaptationSetIndex, representationIndices,
-        dataSource, formatEvaluator, liveEdgeLatencyMs * 1000);
+      DashTrackSelector trackSelector, DataSource dataSource,
+      FormatEvaluator adaptiveFormatEvaluator, long liveEdgeLatencyMs, long elapsedRealtimeOffsetMs,
+      Handler eventHandler, EventListener eventListener) {
+    this(manifestFetcher, manifestFetcher.getManifest(), trackSelector,
+        dataSource, adaptiveFormatEvaluator, new SystemClock(), liveEdgeLatencyMs * 1000,
+        elapsedRealtimeOffsetMs * 1000, true, eventHandler, eventListener);
   }
 
-  private DashChunkSource(ManifestFetcher<MediaPresentationDescription> manifestFetcher,
-      MediaPresentationDescription initialManifest, int adaptationSetIndex,
-      int[] representationIndices, DataSource dataSource, FormatEvaluator formatEvaluator,
-      long liveEdgeLatencyUs) {
+  /**
+   * Constructor to use for live DVR streaming.
+   *
+   * @param manifestFetcher A fetcher for the manifest, which must have already successfully
+   *     completed an initial load.
+   * @param trackSelector Selects tracks from manifest periods to be exposed by this source.
+   * @param dataSource A {@link DataSource} suitable for loading the media data.
+   * @param adaptiveFormatEvaluator For adaptive tracks, selects from the available formats.
+   * @param liveEdgeLatencyMs For live streams, the number of milliseconds that the playback should
+   *     lag behind the "live edge" (i.e. the end of the most recently defined media in the
+   *     manifest). Choosing a small value will minimize latency introduced by the player, however
+   *     note that the value sets an upper bound on the length of media that the player can buffer.
+   *     Hence a small value may increase the probability of rebuffering and playback failures.
+   * @param elapsedRealtimeOffsetMs If known, an estimate of the instantaneous difference between
+   *     server-side unix time and {@link SystemClock#elapsedRealtime()} in milliseconds, specified
+   *     as the server's unix time minus the local elapsed time. It unknown, set to 0.
+   * @param startAtLiveEdge True if the stream should start at the live edge; false if it should
+   *     at the beginning of the live window.
+   * @param eventHandler A handler to use when delivering events to {@code EventListener}. May be
+   *     null if delivery of events is not required.
+   * @param eventListener A listener of events. May be null if delivery of events is not required.
+   */
+  public DashChunkSource(ManifestFetcher<MediaPresentationDescription> manifestFetcher,
+      DashTrackSelector trackSelector, DataSource dataSource,
+      FormatEvaluator adaptiveFormatEvaluator, long liveEdgeLatencyMs, long elapsedRealtimeOffsetMs,
+      boolean startAtLiveEdge, Handler eventHandler, EventListener eventListener) {
+    this(manifestFetcher, manifestFetcher.getManifest(), trackSelector,
+        dataSource, adaptiveFormatEvaluator, new SystemClock(), liveEdgeLatencyMs * 1000,
+        elapsedRealtimeOffsetMs * 1000, startAtLiveEdge, eventHandler, eventListener);
+  }
+
+  /* package */ DashChunkSource(ManifestFetcher<MediaPresentationDescription> manifestFetcher,
+      MediaPresentationDescription initialManifest, DashTrackSelector trackSelector,
+      DataSource dataSource, FormatEvaluator adaptiveFormatEvaluator,
+      Clock systemClock, long liveEdgeLatencyUs, long elapsedRealtimeOffsetUs,
+      boolean startAtLiveEdge, Handler eventHandler, EventListener eventListener) {
     this.manifestFetcher = manifestFetcher;
     this.currentManifest = initialManifest;
-    this.adaptationSetIndex = adaptationSetIndex;
-    this.representationIndices = representationIndices;
+    this.trackSelector = trackSelector;
     this.dataSource = dataSource;
-    this.evaluator = formatEvaluator;
+    this.adaptiveFormatEvaluator = adaptiveFormatEvaluator;
+    this.systemClock = systemClock;
     this.liveEdgeLatencyUs = liveEdgeLatencyUs;
+    this.elapsedRealtimeOffsetUs = elapsedRealtimeOffsetUs;
+    this.startAtLiveEdge = startAtLiveEdge;
+    this.eventHandler = eventHandler;
+    this.eventListener = eventListener;
     this.evaluation = new Evaluation();
-    this.headerBuilder = new StringBuilder();
-
-    psshInfo = getPsshInfo(currentManifest, adaptationSetIndex);
-    Representation[] representations = getFilteredRepresentations(currentManifest,
-        adaptationSetIndex, representationIndices);
-    long periodDurationUs = (representations[0].periodDurationMs == TrackRenderer.UNKNOWN_TIME_US)
-        ? TrackRenderer.UNKNOWN_TIME_US : representations[0].periodDurationMs * 1000;
-    this.trackInfo = new TrackInfo(representations[0].format.mimeType, periodDurationUs);
-
-    this.formats = new Format[representations.length];
-    this.representationHolders = new HashMap<String, RepresentationHolder>();
-    int maxWidth = 0;
-    int maxHeight = 0;
-    for (int i = 0; i < representations.length; i++) {
-      formats[i] = representations[i].format;
-      maxWidth = Math.max(formats[i].width, maxWidth);
-      maxHeight = Math.max(formats[i].height, maxHeight);
-      Extractor extractor = mimeTypeIsWebm(formats[i].mimeType) ? new WebmExtractor()
-          : new FragmentedMp4Extractor();
-      representationHolders.put(formats[i].id,
-          new RepresentationHolder(representations[i], extractor));
-    }
-    this.maxWidth = maxWidth;
-    this.maxHeight = maxHeight;
-    Arrays.sort(formats, new DecreasingBandwidthComparator());
+    this.availableRangeValues = new long[2];
+    periodHolders = new SparseArray<>();
+    tracks = new ArrayList<>();
+    live = initialManifest.dynamic;
   }
 
+  // ChunkSource implementation.
+
   @Override
-  public final void getMaxVideoDimensions(MediaFormat out) {
-    if (trackInfo.mimeType.startsWith("video")) {
-      out.setMaxVideoDimensions(maxWidth, maxHeight);
+  public void maybeThrowError() throws IOException {
+    if (fatalError != null) {
+      throw fatalError;
+    } else if (manifestFetcher != null) {
+      manifestFetcher.maybeThrowError();
     }
   }
 
   @Override
-  public final TrackInfo getTrackInfo() {
-    return trackInfo;
+  public boolean prepare() {
+    if (!prepareCalled) {
+      prepareCalled = true;
+      try {
+        trackSelector.selectTracks(currentManifest, 0, this);
+      } catch (IOException e) {
+        fatalError = e;
+      }
+    }
+    return fatalError == null;
   }
 
   @Override
-  public void enable() {
-    evaluator.enable();
+  public int getTrackCount() {
+    return tracks.size();
+  }
+
+  @Override
+  public final MediaFormat getFormat(int track) {
+    return tracks.get(track).trackFormat;
+  }
+
+  @Override
+  public void enable(int track) {
+    enabledTrack = tracks.get(track);
+    if (enabledTrack.isAdaptive()) {
+      adaptiveFormatEvaluator.enable();
+    }
     if (manifestFetcher != null) {
       manifestFetcher.enable();
-    }
-  }
-
-  @Override
-  public void disable(List<? extends MediaChunk> queue) {
-    evaluator.disable();
-    if (manifestFetcher != null) {
-      manifestFetcher.disable();
+      processManifest(manifestFetcher.getManifest());
+    } else {
+      processManifest(currentManifest);
     }
   }
 
@@ -245,21 +321,7 @@ public class DashChunkSource implements ChunkSource {
 
     MediaPresentationDescription newManifest = manifestFetcher.getManifest();
     if (currentManifest != newManifest && newManifest != null) {
-      Representation[] newRepresentations = DashChunkSource.getFilteredRepresentations(newManifest,
-          adaptationSetIndex, representationIndices);
-      for (Representation representation : newRepresentations) {
-        RepresentationHolder representationHolder =
-            representationHolders.get(representation.format.id);
-        DashSegmentIndex oldIndex = representationHolder.segmentIndex;
-        DashSegmentIndex newIndex = representation.getIndex();
-        int newFirstSegmentNum = newIndex.getFirstSegmentNum();
-        int segmentNumShift = oldIndex.getSegmentNum(newIndex.getTimeUs(newFirstSegmentNum))
-            - newFirstSegmentNum;
-        representationHolder.segmentNumShift += segmentNumShift;
-        representationHolder.segmentIndex = newIndex;
-      }
-      currentManifest = newManifest;
-      finishedCurrentManifest = false;
+      processManifest(newManifest);
     }
 
     // TODO: This is a temporary hack to avoid constantly refreshing the MPD in cases where
@@ -271,8 +333,8 @@ public class DashChunkSource implements ChunkSource {
       minUpdatePeriod = 5000;
     }
 
-    if (finishedCurrentManifest && (SystemClock.elapsedRealtime()
-        > manifestFetcher.getManifestLoadTimestamp() + minUpdatePeriod)) {
+    if (android.os.SystemClock.elapsedRealtime()
+        > manifestFetcher.getManifestLoadStartTimestamp() + minUpdatePeriod) {
       manifestFetcher.requestRefresh();
     }
   }
@@ -287,8 +349,15 @@ public class DashChunkSource implements ChunkSource {
 
     evaluation.queueSize = queue.size();
     if (evaluation.format == null || !lastChunkWasInitialization) {
-      evaluator.evaluate(queue, playbackPositionUs, formats, evaluation);
+      if (enabledTrack.isAdaptive()) {
+        adaptiveFormatEvaluator.evaluate(queue, playbackPositionUs, enabledTrack.adaptiveFormats,
+            evaluation);
+      } else {
+        evaluation.format = enabledTrack.fixedFormat;
+        evaluation.trigger = Chunk.TRIGGER_MANUAL;
+      }
     }
+
     Format selectedFormat = evaluation.format;
     out.queueSize = evaluation.queueSize;
 
@@ -296,100 +365,147 @@ public class DashChunkSource implements ChunkSource {
       out.chunk = null;
       return;
     } else if (out.queueSize == queue.size() && out.chunk != null
-        && out.chunk.format.id.equals(selectedFormat.id)) {
+        && out.chunk.format.equals(selectedFormat)) {
       // We already have a chunk, and the evaluation hasn't changed either the format or the size
       // of the queue. Leave unchanged.
       return;
     }
 
-    RepresentationHolder representationHolder = representationHolders.get(selectedFormat.id);
+    // In all cases where we return before instantiating a new chunk, we want out.chunk to be null.
+    out.chunk = null;
+
+    boolean startingNewPeriod;
+    PeriodHolder periodHolder;
+
+    availableRange.getCurrentBoundsUs(availableRangeValues);
+    if (queue.isEmpty()) {
+      if (live) {
+        if (startAtLiveEdge) {
+          // We want live streams to start at the live edge instead of the beginning of the
+          // manifest
+          seekPositionUs = Math.max(availableRangeValues[0],
+              availableRangeValues[1] - liveEdgeLatencyUs);
+        } else {
+          // we subtract 1 from the upper bound because it's exclusive for that bound
+          seekPositionUs = Math.min(seekPositionUs, availableRangeValues[1] - 1);
+          seekPositionUs = Math.max(seekPositionUs, availableRangeValues[0]);
+        }
+      }
+
+      periodHolder = findPeriodHolder(seekPositionUs);
+      startingNewPeriod = true;
+    } else {
+      if (startAtLiveEdge) {
+        // now that we know the player is consuming media chunks (since the queue isn't empty),
+        // set startAtLiveEdge to false so that the user can perform seek operations
+        startAtLiveEdge = false;
+      }
+
+      MediaChunk previous = queue.get(out.queueSize - 1);
+      long nextSegmentStartTimeUs = previous.endTimeUs;
+      if (live && nextSegmentStartTimeUs < availableRangeValues[0]) {
+        // This is before the first chunk in the current manifest.
+        fatalError = new BehindLiveWindowException();
+        return;
+      } else if (currentManifest.dynamic && nextSegmentStartTimeUs >= availableRangeValues[1]) {
+        // This chunk is beyond the last chunk in the current manifest. If the index is bounded
+        // we'll need to wait until it's refreshed. If it's unbounded we just need to wait for a
+        // while before attempting to load the chunk.
+        return;
+      } else if (!currentManifest.dynamic) {
+        // The current manifest isn't dynamic, so check whether we've reached the end of the stream.
+        PeriodHolder lastPeriodHolder = periodHolders.valueAt(periodHolders.size() - 1);
+        if (previous.parentId == lastPeriodHolder.localIndex) {
+          RepresentationHolder representationHolder =
+              lastPeriodHolder.representationHolders.get(previous.format.id);
+          if (representationHolder.isLastSegment(previous.chunkIndex)) {
+            out.endOfStream = true;
+            return;
+          }
+        }
+      }
+
+      startingNewPeriod = false;
+      periodHolder = periodHolders.get(previous.parentId);
+      if (periodHolder == null) {
+        // The previous chunk was from a period that's no longer on the manifest, therefore the
+        // next chunk must be the first one in the first period that's still on the manifest
+        // (note that we can't actually update the segmentNum yet because the new period might
+        // have a different sequence and it's segmentIndex might not have been loaded yet).
+        periodHolder = periodHolders.valueAt(0);
+        startingNewPeriod = true;
+      } else if (!periodHolder.isIndexUnbounded()) {
+        RepresentationHolder representationHolder =
+            periodHolder.representationHolders.get(previous.format.id);
+        if (representationHolder.isLastSegment(previous.chunkIndex)) {
+          // We reached the end of a period. Start the next one.
+          periodHolder = periodHolders.get(previous.parentId + 1);
+          startingNewPeriod = true;
+        }
+      }
+    }
+
+    RepresentationHolder representationHolder =
+        periodHolder.representationHolders.get(selectedFormat.id);
     Representation selectedRepresentation = representationHolder.representation;
-    DashSegmentIndex segmentIndex = representationHolder.segmentIndex;
-    Extractor extractor = representationHolder.extractor;
 
     RangedUri pendingInitializationUri = null;
     RangedUri pendingIndexUri = null;
 
-    if (extractor.getFormat() == null) {
+    MediaFormat mediaFormat = representationHolder.mediaFormat;
+    if (mediaFormat == null) {
       pendingInitializationUri = selectedRepresentation.getInitializationUri();
     }
-    if (segmentIndex == null) {
+    if (representationHolder.segmentIndex == null) {
       pendingIndexUri = selectedRepresentation.getIndexUri();
     }
 
     if (pendingInitializationUri != null || pendingIndexUri != null) {
       // We have initialization and/or index requests to make.
       Chunk initializationChunk = newInitializationChunk(pendingInitializationUri, pendingIndexUri,
-          selectedRepresentation, extractor, dataSource, evaluation.trigger);
+          selectedRepresentation, representationHolder.extractorWrapper, dataSource,
+          periodHolder.localIndex, evaluation.trigger);
       lastChunkWasInitialization = true;
       out.chunk = initializationChunk;
       return;
     }
 
-    // TODO: Use UtcTimingElement where possible.
-    long nowUs = System.currentTimeMillis() * 1000;
-
-    int firstAvailableSegmentNum = segmentIndex.getFirstSegmentNum();
-    int lastAvailableSegmentNum = segmentIndex.getLastSegmentNum();
-    boolean indexUnbounded = lastAvailableSegmentNum == DashSegmentIndex.INDEX_UNBOUNDED;
-    if (indexUnbounded) {
-      // The index is itself unbounded. We need to use the current time to calculate the range of
-      // available segments.
-      long liveEdgeTimestampUs = nowUs - currentManifest.availabilityStartTime * 1000;
-      if (currentManifest.timeShiftBufferDepth != -1) {
-        long bufferDepthUs = currentManifest.timeShiftBufferDepth * 1000;
-        firstAvailableSegmentNum = Math.max(firstAvailableSegmentNum,
-            segmentIndex.getSegmentNum(liveEdgeTimestampUs - bufferDepthUs));
-      }
-      // getSegmentNum(liveEdgeTimestampUs) will not be completed yet, so subtract one to get the
-      // index of the last completed segment.
-      lastAvailableSegmentNum = segmentIndex.getSegmentNum(liveEdgeTimestampUs) - 1;
-    }
-
-    int segmentNum;
-    if (queue.isEmpty()) {
-      if (currentManifest.dynamic) {
-        seekPositionUs = getLiveSeekPosition(nowUs, indexUnbounded, segmentIndex.isExplicit());
-      }
-      segmentNum = segmentIndex.getSegmentNum(seekPositionUs);
-    } else {
-      segmentNum = queue.get(out.queueSize - 1).nextChunkIndex
-          - representationHolder.segmentNumShift;
-    }
-
-    if (currentManifest.dynamic) {
-      if (segmentNum < firstAvailableSegmentNum) {
-        // This is before the first chunk in the current manifest.
-        fatalError = new BehindLiveWindowException();
-        return;
-      } else if (segmentNum > lastAvailableSegmentNum) {
-        // This chunk is beyond the last chunk in the current manifest. If the index is bounded
-        // we'll need to refresh it. If it's unbounded we just need to wait for a while before
-        // attempting to load the chunk.
-        finishedCurrentManifest = !indexUnbounded;
-        return;
-      } else if (!indexUnbounded && segmentNum == lastAvailableSegmentNum) {
-        // This is the last chunk in a dynamic bounded manifest. We'll need to refresh the manifest
-        // to obtain the next chunk.
-        finishedCurrentManifest = true;
-      }
-    }
-
-    if (segmentNum == -1) {
-      out.chunk = null;
-      return;
-    }
-
-    Chunk nextMediaChunk = newMediaChunk(representationHolder, dataSource, segmentNum,
-        evaluation.trigger);
+    int segmentNum = queue.isEmpty() ? representationHolder.getSegmentNum(seekPositionUs)
+          : startingNewPeriod ? representationHolder.getFirstAvailableSegmentNum()
+          : queue.get(out.queueSize - 1).chunkIndex + 1;
+    Chunk nextMediaChunk = newMediaChunk(periodHolder, representationHolder, dataSource,
+        mediaFormat, segmentNum, evaluation.trigger);
     lastChunkWasInitialization = false;
     out.chunk = nextMediaChunk;
   }
 
   @Override
-  public IOException getError() {
-    return fatalError != null ? fatalError
-        : (manifestFetcher != null ? manifestFetcher.getError() : null);
+  public void onChunkLoadCompleted(Chunk chunk) {
+    if (chunk instanceof InitializationChunk) {
+      InitializationChunk initializationChunk = (InitializationChunk) chunk;
+      String formatId = initializationChunk.format.id;
+      PeriodHolder periodHolder = periodHolders.get(initializationChunk.parentId);
+      if (periodHolder == null) {
+        // period for this initialization chunk may no longer be on the manifest
+        return;
+      }
+
+      RepresentationHolder representationHolder = periodHolder.representationHolders.get(formatId);
+      if (initializationChunk.hasFormat()) {
+        representationHolder.mediaFormat = initializationChunk.getFormat();
+      }
+      if (initializationChunk.hasSeekMap()) {
+        representationHolder.segmentIndex = new DashWrappingSegmentIndex(
+            (ChunkIndex) initializationChunk.getSeekMap(),
+            initializationChunk.dataSpec.uri.toString());
+      }
+
+      // The null check avoids overwriting drmInitData obtained from the manifest with drmInitData
+      // obtained from the stream, as per DASH IF Interoperability Recommendations V3.0, 7.5.3.
+      if (periodHolder.drmInitData == null && initializationChunk.hasDrmInitData()) {
+        periodHolder.drmInitData = initializationChunk.getDrmInitData();
+      }
+    }
   }
 
   @Override
@@ -397,201 +513,599 @@ public class DashChunkSource implements ChunkSource {
     // Do nothing.
   }
 
-  private boolean mimeTypeIsWebm(String mimeType) {
-    return mimeType.startsWith(MimeTypes.VIDEO_WEBM) || mimeType.startsWith(MimeTypes.AUDIO_WEBM);
+  @Override
+  public void disable(List<? extends MediaChunk> queue) {
+    if (enabledTrack.isAdaptive()) {
+      adaptiveFormatEvaluator.disable();
+    }
+    if (manifestFetcher != null) {
+      manifestFetcher.disable();
+    }
+    periodHolders.clear();
+    evaluation.format = null;
+    availableRange = null;
+    fatalError = null;
+    enabledTrack = null;
+  }
+
+  // DashTrackSelector.Output implementation.
+
+  @Override
+  public void adaptiveTrack(MediaPresentationDescription manifest, int periodIndex,
+      int adaptationSetIndex, int[] representationIndices) {
+    if (adaptiveFormatEvaluator == null) {
+      Log.w(TAG, "Skipping adaptive track (missing format evaluator)");
+      return;
+    }
+    AdaptationSet adaptationSet = manifest.getPeriod(periodIndex).adaptationSets.get(
+        adaptationSetIndex);
+    int maxWidth = 0;
+    int maxHeight = 0;
+    Format maxHeightRepresentationFormat = null;
+    Format[] representationFormats = new Format[representationIndices.length];
+    for (int i = 0; i < representationFormats.length; i++) {
+      Format format = adaptationSet.representations.get(representationIndices[i]).format;
+      if (maxHeightRepresentationFormat == null || format.height > maxHeight) {
+        maxHeightRepresentationFormat = format;
+      }
+      maxWidth = Math.max(maxWidth, format.width);
+      maxHeight = Math.max(maxHeight, format.height);
+      representationFormats[i] = format;
+    }
+    Arrays.sort(representationFormats, new DecreasingBandwidthComparator());
+    long trackDurationUs = live ? C.UNKNOWN_TIME_US : manifest.duration * 1000;
+    String mediaMimeType = getMediaMimeType(maxHeightRepresentationFormat);
+    if (mediaMimeType == null) {
+      Log.w(TAG, "Skipped adaptive track (unknown media mime type)");
+      return;
+    }
+    MediaFormat trackFormat = getTrackFormat(adaptationSet.type, maxHeightRepresentationFormat,
+        mediaMimeType, trackDurationUs);
+    if (trackFormat == null) {
+      Log.w(TAG, "Skipped adaptive track (unknown media format)");
+      return;
+    }
+    tracks.add(new ExposedTrack(trackFormat.copyAsAdaptive(), adaptationSetIndex,
+        representationFormats, maxWidth, maxHeight));
+  }
+
+  @Override
+  public void fixedTrack(MediaPresentationDescription manifest, int periodIndex,
+      int adaptationSetIndex, int representationIndex) {
+    List<AdaptationSet> adaptationSets = manifest.getPeriod(periodIndex).adaptationSets;
+    AdaptationSet adaptationSet = adaptationSets.get(adaptationSetIndex);
+    Format representationFormat = adaptationSet.representations.get(representationIndex).format;
+    String mediaMimeType = getMediaMimeType(representationFormat);
+    if (mediaMimeType == null) {
+      Log.w(TAG, "Skipped track " + representationFormat.id + " (unknown media mime type)");
+      return;
+    }
+    MediaFormat trackFormat = getTrackFormat(adaptationSet.type, representationFormat,
+        mediaMimeType, manifest.dynamic ? C.UNKNOWN_TIME_US : manifest.duration * 1000);
+    if (trackFormat == null) {
+      Log.w(TAG, "Skipped track " + representationFormat.id + " (unknown media format)");
+      return;
+    }
+    tracks.add(new ExposedTrack(trackFormat, adaptationSetIndex, representationFormat));
+  }
+
+  // Private methods.
+
+  // Visible for testing.
+  /* package */ TimeRange getAvailableRange() {
+    return availableRange;
+  }
+
+  private static MediaPresentationDescription buildManifest(long durationMs,
+      int adaptationSetType, List<Representation> representations) {
+    AdaptationSet adaptationSet = new AdaptationSet(0, adaptationSetType, representations);
+    Period period = new Period(null, 0, Collections.singletonList(adaptationSet));
+    return new MediaPresentationDescription(-1, durationMs, -1, false, -1, -1, null, null,
+        Collections.singletonList(period));
+  }
+
+  private static MediaFormat getTrackFormat(int adaptationSetType, Format format,
+      String mediaMimeType, long durationUs) {
+    switch (adaptationSetType) {
+      case AdaptationSet.TYPE_VIDEO:
+        return MediaFormat.createVideoFormat(MediaFormat.NO_VALUE, mediaMimeType, format.bitrate,
+            MediaFormat.NO_VALUE, durationUs, format.width, format.height, null);
+      case AdaptationSet.TYPE_AUDIO:
+        return MediaFormat.createAudioFormat(MediaFormat.NO_VALUE, mediaMimeType, format.bitrate,
+            MediaFormat.NO_VALUE, durationUs, format.audioChannels, format.audioSamplingRate, null,
+            format.language);
+      case AdaptationSet.TYPE_TEXT:
+        return MediaFormat.createTextFormat(MediaFormat.NO_VALUE, mediaMimeType, format.bitrate,
+            durationUs, format.language);
+      default:
+        return null;
+    }
+  }
+
+  private static String getMediaMimeType(Format format) {
+    String formatMimeType = format.mimeType;
+    if (MimeTypes.isAudio(formatMimeType)) {
+      return getAudioMediaMimeType(format);
+    } else if (MimeTypes.isVideo(formatMimeType)) {
+      return getVideoMediaMimeType(format);
+    } else if (mimeTypeIsRawText(formatMimeType)) {
+      return formatMimeType;
+    } else if (MimeTypes.APPLICATION_MP4.equals(formatMimeType) && "stpp".equals(format.codecs)) {
+      return MimeTypes.APPLICATION_TTML;
+    } else {
+      return null;
+    }
+  }
+
+  private static String getVideoMediaMimeType(Format format) {
+    String codecs = format.codecs;
+    if (TextUtils.isEmpty(codecs)) {
+      Log.w(TAG, "Codecs attribute missing: " + format.id);
+      return MimeTypes.VIDEO_UNKNOWN;
+    } else if (codecs.startsWith("avc1") || codecs.startsWith("avc3")) {
+      return MimeTypes.VIDEO_H264;
+    } else if (codecs.startsWith("hev1") || codecs.startsWith("hvc1")) {
+      return MimeTypes.VIDEO_H265;
+    } else if (codecs.startsWith("vp9")) {
+      return MimeTypes.VIDEO_VP9;
+    } else if (codecs.startsWith("vp8")) {
+      return MimeTypes.VIDEO_VP8;
+    }
+    Log.w(TAG, "Failed to parse mime from codecs: " + format.id + ", " + codecs);
+    return MimeTypes.VIDEO_UNKNOWN;
+  }
+
+  private static String getAudioMediaMimeType(Format format) {
+    String codecs = format.codecs;
+    if (TextUtils.isEmpty(codecs)) {
+      Log.w(TAG, "Codecs attribute missing: " + format.id);
+      return MimeTypes.AUDIO_UNKNOWN;
+    } else if (codecs.startsWith("mp4a")) {
+      return MimeTypes.AUDIO_AAC;
+    } else if (codecs.startsWith("ac-3") || codecs.startsWith("dac3")) {
+      return MimeTypes.AUDIO_AC3;
+    } else if (codecs.startsWith("ec-3") || codecs.startsWith("dec3")) {
+      return MimeTypes.AUDIO_EC3;
+    } else if (codecs.startsWith("dtsc") || codecs.startsWith("dtse")) {
+      return MimeTypes.AUDIO_DTS;
+    } else if (codecs.startsWith("dtsh") || codecs.startsWith("dtsl")) {
+      return MimeTypes.AUDIO_DTS_HD;
+    } else if (codecs.startsWith("opus")) {
+      return MimeTypes.AUDIO_OPUS;
+    }
+    Log.w(TAG, "Failed to parse mime from codecs: " + format.id + ", " + codecs);
+    return MimeTypes.AUDIO_UNKNOWN;
+  }
+
+  /* package */ static boolean mimeTypeIsWebm(String mimeType) {
+    return mimeType.startsWith(MimeTypes.VIDEO_WEBM) || mimeType.startsWith(MimeTypes.AUDIO_WEBM)
+        || mimeType.startsWith(MimeTypes.APPLICATION_WEBM);
+  }
+
+  /* package */ static boolean mimeTypeIsRawText(String mimeType) {
+    return MimeTypes.TEXT_VTT.equals(mimeType) || MimeTypes.APPLICATION_TTML.equals(mimeType);
   }
 
   private Chunk newInitializationChunk(RangedUri initializationUri, RangedUri indexUri,
-      Representation representation, Extractor extractor, DataSource dataSource,
-      int trigger) {
-    int expectedExtractorResult = Extractor.RESULT_END_OF_STREAM;
-    long indexAnchor = 0;
+      Representation representation, ChunkExtractorWrapper extractor, DataSource dataSource,
+      int manifestIndex, int trigger) {
     RangedUri requestUri;
     if (initializationUri != null) {
       // It's common for initialization and index data to be stored adjacently. Attempt to merge
       // the two requests together to request both at once.
-      expectedExtractorResult |= Extractor.RESULT_READ_INIT;
       requestUri = initializationUri.attemptMerge(indexUri);
-      if (requestUri != null) {
-        expectedExtractorResult |= Extractor.RESULT_READ_INDEX;
-        if (extractor.hasRelativeIndexOffsets()) {
-          indexAnchor = indexUri.start + indexUri.length;
-        }
-      } else {
+      if (requestUri == null) {
         requestUri = initializationUri;
       }
     } else {
       requestUri = indexUri;
-      if (extractor.hasRelativeIndexOffsets()) {
-        indexAnchor = indexUri.start + indexUri.length;
-      }
-      expectedExtractorResult |= Extractor.RESULT_READ_INDEX;
     }
     DataSpec dataSpec = new DataSpec(requestUri.getUri(), requestUri.start, requestUri.length,
         representation.getCacheKey());
-
-    return new InitializationLoadable(dataSource, dataSpec, trigger, representation.format,
-        extractor, expectedExtractorResult, indexAnchor);
+    return new InitializationChunk(dataSource, dataSpec, trigger, representation.format,
+        extractor, manifestIndex);
   }
 
-  private Chunk newMediaChunk(RepresentationHolder representationHolder, DataSource dataSource,
-      int segmentNum, int trigger) {
+  private Chunk newMediaChunk(PeriodHolder periodHolder, RepresentationHolder representationHolder,
+      DataSource dataSource, MediaFormat mediaFormat, int segmentNum, int trigger) {
     Representation representation = representationHolder.representation;
-    DashSegmentIndex segmentIndex = representationHolder.segmentIndex;
-
-    long startTimeUs = segmentIndex.getTimeUs(segmentNum);
-    long endTimeUs = startTimeUs + segmentIndex.getDurationUs(segmentNum);
-
-    boolean isLastSegment = !currentManifest.dynamic
-        && segmentNum == segmentIndex.getLastSegmentNum();
-    int nextAbsoluteSegmentNum = isLastSegment ? -1
-        : (representationHolder.segmentNumShift + segmentNum + 1);
-
-    RangedUri segmentUri = segmentIndex.getSegmentUrl(segmentNum);
+    Format format = representation.format;
+    long startTimeUs = representationHolder.getSegmentStartTimeUs(segmentNum);
+    long endTimeUs = representationHolder.getSegmentEndTimeUs(segmentNum);
+    RangedUri segmentUri = representationHolder.getSegmentUrl(segmentNum);
     DataSpec dataSpec = new DataSpec(segmentUri.getUri(), segmentUri.start, segmentUri.length,
         representation.getCacheKey());
 
-    long presentationTimeOffsetUs = representation.presentationTimeOffsetUs;
-    if (representation.format.mimeType.equals(MimeTypes.TEXT_VTT)) {
-      if (representationHolder.vttHeaderOffsetUs != presentationTimeOffsetUs) {
-        // Update the VTT header.
-        headerBuilder.setLength(0);
-        headerBuilder.append(WebvttParser.EXO_HEADER).append("=")
-            .append(WebvttParser.OFFSET).append(presentationTimeOffsetUs).append("\n");
-        representationHolder.vttHeader = headerBuilder.toString().getBytes();
-        representationHolder.vttHeaderOffsetUs = presentationTimeOffsetUs;
-      }
-      return new SingleSampleMediaChunk(dataSource, dataSpec, representation.format, 0,
-          startTimeUs, endTimeUs, nextAbsoluteSegmentNum, null, representationHolder.vttHeader);
+    long sampleOffsetUs = periodHolder.startTimeUs - representation.presentationTimeOffsetUs;
+    if (mimeTypeIsRawText(format.mimeType)) {
+      return new SingleSampleMediaChunk(dataSource, dataSpec, Chunk.TRIGGER_INITIAL, format,
+          startTimeUs, endTimeUs, segmentNum, enabledTrack.trackFormat, null,
+          periodHolder.localIndex);
     } else {
-      return new ContainerMediaChunk(dataSource, dataSpec, representation.format, trigger,
-          startTimeUs, endTimeUs, nextAbsoluteSegmentNum, representationHolder.extractor, psshInfo,
-          false, presentationTimeOffsetUs);
+      boolean isMediaFormatFinal = (mediaFormat != null);
+      return new ContainerMediaChunk(dataSource, dataSpec, trigger, format, startTimeUs, endTimeUs,
+          segmentNum, sampleOffsetUs, representationHolder.extractorWrapper, mediaFormat,
+          enabledTrack.adaptiveMaxWidth, enabledTrack.adaptiveMaxHeight, periodHolder.drmInitData,
+          isMediaFormatFinal, periodHolder.localIndex);
     }
   }
 
-  /**
-   * For live playbacks, determines the seek position that snaps playback to be
-   * {@link #liveEdgeLatencyUs} behind the live edge of the current manifest
-   *
-   * @param nowUs An estimate of the current server time, in microseconds.
-   * @param indexUnbounded True if the segment index for this source is unbounded. False otherwise.
-   * @param indexExplicit True if the segment index is explicit. False otherwise.
-   * @return The seek position in microseconds.
-   */
-  private long getLiveSeekPosition(long nowUs, boolean indexUnbounded, boolean indexExplicit) {
-    long liveEdgeTimestampUs;
-    if (indexUnbounded) {
-      liveEdgeTimestampUs = nowUs - currentManifest.availabilityStartTime * 1000;
+  private long getNowUnixTimeUs() {
+    if (elapsedRealtimeOffsetUs != 0) {
+      return (systemClock.elapsedRealtime() * 1000) + elapsedRealtimeOffsetUs;
     } else {
-      liveEdgeTimestampUs = Long.MIN_VALUE;
-      for (RepresentationHolder representationHolder : representationHolders.values()) {
-        DashSegmentIndex segmentIndex = representationHolder.segmentIndex;
-        int lastSegmentNum = segmentIndex.getLastSegmentNum();
-        long indexLiveEdgeTimestampUs = segmentIndex.getTimeUs(lastSegmentNum)
-            + segmentIndex.getDurationUs(lastSegmentNum);
-        liveEdgeTimestampUs = Math.max(liveEdgeTimestampUs, indexLiveEdgeTimestampUs);
-      }
-      if (!indexExplicit) {
-        // Some segments defined by the index may not be available yet. Bound the calculated live
-        // edge based on the elapsed time since the manifest became available.
-        liveEdgeTimestampUs = Math.min(liveEdgeTimestampUs,
-            nowUs - currentManifest.availabilityStartTime * 1000);
-      }
-    }
-    return liveEdgeTimestampUs - liveEdgeLatencyUs;
-  }
-
-  private static Representation[] getFilteredRepresentations(MediaPresentationDescription manifest,
-      int adaptationSetIndex, int[] representationIndices) {
-    AdaptationSet adaptationSet = manifest.periods.get(0).adaptationSets.get(adaptationSetIndex);
-    List<Representation> representations = adaptationSet.representations;
-    if (representationIndices == null) {
-      Representation[] filteredRepresentations = new Representation[representations.size()];
-      representations.toArray(filteredRepresentations);
-      return filteredRepresentations;
-    } else {
-      Representation[] filteredRepresentations = new Representation[representationIndices.length];
-      for (int i = 0; i < representationIndices.length; i++) {
-        filteredRepresentations[i] = representations.get(representationIndices[i]);
-      }
-      return filteredRepresentations;
+      return System.currentTimeMillis() * 1000;
     }
   }
 
-  private static Map<UUID, byte[]> getPsshInfo(MediaPresentationDescription manifest,
-      int adaptationSetIndex) {
-    AdaptationSet adaptationSet = manifest.periods.get(0).adaptationSets.get(adaptationSetIndex);
-    if (adaptationSet.contentProtections.isEmpty()) {
-      return null;
-    } else {
-      Map<UUID, byte[]> psshInfo = new HashMap<UUID, byte[]>();
-      for (ContentProtection contentProtection : adaptationSet.contentProtections) {
-        if (contentProtection.uuid != null && contentProtection.data != null) {
-          psshInfo.put(contentProtection.uuid, contentProtection.data);
+  private PeriodHolder findPeriodHolder(long positionUs) {
+    // if positionUs is before the first period, return the first period
+    if (positionUs < periodHolders.valueAt(0).getAvailableStartTimeUs()) {
+      return periodHolders.valueAt(0);
+    }
+
+    for (int i = 0; i < periodHolders.size() - 1; i++) {
+      PeriodHolder periodHolder = periodHolders.valueAt(i);
+      if (positionUs < periodHolder.getAvailableEndTimeUs()) {
+        return periodHolder;
+      }
+    }
+
+    // positionUs is within or after the last period
+    return periodHolders.valueAt(periodHolders.size() - 1);
+  }
+
+  private void processManifest(MediaPresentationDescription manifest) {
+    // Remove old periods.
+    Period firstPeriod = manifest.getPeriod(0);
+    while (periodHolders.size() > 0
+        && periodHolders.valueAt(0).startTimeUs < firstPeriod.startMs * 1000) {
+      PeriodHolder periodHolder = periodHolders.valueAt(0);
+      // TODO: Use periodHolders.removeAt(0) if the minimum API level is ever increased to 11.
+      periodHolders.remove(periodHolder.localIndex);
+    }
+
+    // Update existing periods. Only the first and last periods can change.
+    try {
+      int periodHolderCount = periodHolders.size();
+      if (periodHolderCount > 0) {
+        periodHolders.valueAt(0).updatePeriod(manifest, 0, enabledTrack);
+        if (periodHolderCount > 1) {
+          int lastIndex = periodHolderCount - 1;
+          periodHolders.valueAt(lastIndex).updatePeriod(manifest, lastIndex, enabledTrack);
         }
       }
-      return psshInfo.isEmpty() ? null : psshInfo;
+    } catch (BehindLiveWindowException e) {
+      fatalError = e;
+      return;
+    }
+
+    // Add new periods.
+    for (int i = periodHolders.size(); i < manifest.getPeriodCount(); i++) {
+      PeriodHolder holder = new PeriodHolder(nextPeriodHolderIndex, manifest, i, enabledTrack);
+      periodHolders.put(nextPeriodHolderIndex, holder);
+      nextPeriodHolderIndex++;
+    }
+
+    // Update the available range.
+    TimeRange newAvailableRange = getAvailableRange(getNowUnixTimeUs());
+    if (availableRange == null || !availableRange.equals(newAvailableRange)) {
+      availableRange = newAvailableRange;
+      notifyAvailableRangeChanged(availableRange);
+    }
+
+    currentManifest = manifest;
+  }
+
+  private TimeRange getAvailableRange(long nowUnixTimeUs) {
+    PeriodHolder firstPeriod = periodHolders.valueAt(0);
+    PeriodHolder lastPeriod = periodHolders.valueAt(periodHolders.size() - 1);
+
+    if (!currentManifest.dynamic || lastPeriod.isIndexExplicit()) {
+      return new StaticTimeRange(firstPeriod.getAvailableStartTimeUs(),
+          lastPeriod.getAvailableEndTimeUs());
+    }
+
+    long minStartPositionUs = firstPeriod.getAvailableStartTimeUs();
+    long maxEndPositionUs = lastPeriod.isIndexUnbounded() ? Long.MAX_VALUE
+        : lastPeriod.getAvailableEndTimeUs();
+    long elapsedRealtimeAtZeroUs = (systemClock.elapsedRealtime() * 1000)
+        - (nowUnixTimeUs - (currentManifest.availabilityStartTime * 1000));
+    long timeShiftBufferDepthUs = currentManifest.timeShiftBufferDepth == -1 ? -1
+        : currentManifest.timeShiftBufferDepth * 1000;
+    return new DynamicTimeRange(minStartPositionUs, maxEndPositionUs, elapsedRealtimeAtZeroUs,
+        timeShiftBufferDepthUs, systemClock);
+  }
+
+  private void notifyAvailableRangeChanged(final TimeRange seekRange) {
+    if (eventHandler != null && eventListener != null) {
+      eventHandler.post(new Runnable() {
+        @Override
+        public void run() {
+          eventListener.onAvailableRangeChanged(seekRange);
+        }
+      });
     }
   }
 
-  private static MediaPresentationDescription buildManifest(List<Representation> representations) {
-    Representation firstRepresentation = representations.get(0);
-    AdaptationSet adaptationSet = new AdaptationSet(0, AdaptationSet.TYPE_UNKNOWN, representations);
-    Period period = new Period(null, firstRepresentation.periodStartMs,
-        firstRepresentation.periodDurationMs, Collections.singletonList(adaptationSet));
-    long duration = firstRepresentation.periodDurationMs - firstRepresentation.periodStartMs;
-    return new MediaPresentationDescription(-1, duration, -1, false, -1, -1, null,
-        Collections.singletonList(period));
-  }
+  // Private classes.
 
-  private class InitializationLoadable extends Chunk {
+  private static final class ExposedTrack {
 
-    private final Extractor extractor;
-    private final int expectedExtractorResult;
-    private final long indexAnchor;
-    private final Uri uri;
+    public final MediaFormat trackFormat;
 
-    public InitializationLoadable(DataSource dataSource, DataSpec dataSpec, int trigger,
-        Format format, Extractor extractor, int expectedExtractorResult,
-        long indexAnchor) {
-      super(dataSource, dataSpec, format, trigger);
-      this.extractor = extractor;
-      this.expectedExtractorResult = expectedExtractorResult;
-      this.indexAnchor = indexAnchor;
-      this.uri = dataSpec.uri;
+    private final int adaptationSetIndex;
+
+    // Non-adaptive track variables.
+    private final Format fixedFormat;
+
+    // Adaptive track variables.
+    private final Format[] adaptiveFormats;
+    private final int adaptiveMaxWidth;
+    private final int adaptiveMaxHeight;
+
+    public ExposedTrack(MediaFormat trackFormat, int adaptationSetIndex, Format fixedFormat) {
+      this.trackFormat = trackFormat;
+      this.adaptationSetIndex = adaptationSetIndex;
+      this.fixedFormat = fixedFormat;
+      this.adaptiveFormats = null;
+      this.adaptiveMaxWidth = -1;
+      this.adaptiveMaxHeight = -1;
     }
 
-    @Override
-    protected void consumeStream(NonBlockingInputStream stream) throws IOException {
-      int result = extractor.read(stream, null);
-      if (result != expectedExtractorResult) {
-        throw new ParserException("Invalid extractor result. Expected "
-            + expectedExtractorResult + ", got " + result);
-      }
-      if ((result & Extractor.RESULT_READ_INDEX) != 0) {
-        representationHolders.get(format.id).segmentIndex =
-            new DashWrappingSegmentIndex(extractor.getIndex(), uri, indexAnchor);
-      }
+    public ExposedTrack(MediaFormat trackFormat, int adaptationSetIndex, Format[] adaptiveFormats,
+        int maxWidth, int maxHeight) {
+      this.trackFormat = trackFormat;
+      this.adaptationSetIndex = adaptationSetIndex;
+      this.adaptiveFormats = adaptiveFormats;
+      this.adaptiveMaxWidth = maxWidth;
+      this.adaptiveMaxHeight = maxHeight;
+      this.fixedFormat = null;
+    }
+
+    public boolean isAdaptive() {
+      return adaptiveFormats != null;
     }
 
   }
 
-  private static class RepresentationHolder {
+  private static final class RepresentationHolder {
 
-    public final Representation representation;
-    public final Extractor extractor;
+    public final ChunkExtractorWrapper extractorWrapper;
 
+    public Representation representation;
     public DashSegmentIndex segmentIndex;
-    public int segmentNumShift;
+    public MediaFormat mediaFormat;
 
-    public long vttHeaderOffsetUs;
-    public byte[] vttHeader;
+    private final long periodStartTimeUs;
 
-    public RepresentationHolder(Representation representation, Extractor extractor) {
+    private long periodDurationUs;
+    private int segmentNumShift;
+
+    public RepresentationHolder(long periodStartTimeUs, long periodDurationUs,
+        Representation representation) {
+      this.periodStartTimeUs = periodStartTimeUs;
+      this.periodDurationUs = periodDurationUs;
       this.representation = representation;
-      this.extractor = extractor;
-      this.segmentIndex = representation.getIndex();
+      String mimeType = representation.format.mimeType;
+      extractorWrapper = mimeTypeIsRawText(mimeType) ? null : new ChunkExtractorWrapper(
+          mimeTypeIsWebm(mimeType) ? new WebmExtractor() : new FragmentedMp4Extractor());
+      segmentIndex = representation.getIndex();
+    }
+
+    public void updateRepresentation(long newPeriodDurationUs, Representation newRepresentation)
+        throws BehindLiveWindowException{
+      DashSegmentIndex oldIndex = representation.getIndex();
+      DashSegmentIndex newIndex = newRepresentation.getIndex();
+
+      periodDurationUs = newPeriodDurationUs;
+      representation = newRepresentation;
+      if (oldIndex == null) {
+        // Segment numbers cannot shift if the index isn't defined by the manifest.
+        return;
+      }
+
+      segmentIndex = newIndex;
+      if (!oldIndex.isExplicit()) {
+        // Segment numbers cannot shift if the index isn't explicit.
+        return;
+      }
+
+      int oldIndexLastSegmentNum = oldIndex.getLastSegmentNum(periodDurationUs);
+      long oldIndexEndTimeUs = oldIndex.getTimeUs(oldIndexLastSegmentNum)
+          + oldIndex.getDurationUs(oldIndexLastSegmentNum, periodDurationUs);
+      int newIndexFirstSegmentNum = newIndex.getFirstSegmentNum();
+      long newIndexStartTimeUs = newIndex.getTimeUs(newIndexFirstSegmentNum);
+      if (oldIndexEndTimeUs == newIndexStartTimeUs) {
+        // The new index continues where the old one ended, with no overlap.
+        segmentNumShift += oldIndex.getLastSegmentNum(periodDurationUs) + 1
+            - newIndexFirstSegmentNum;
+      } else if (oldIndexEndTimeUs < newIndexStartTimeUs) {
+        // There's a gap between the old index and the new one which means we've slipped behind the
+        // live window and can't proceed.
+        throw new BehindLiveWindowException();
+      } else {
+        // The new index overlaps with the old one.
+        segmentNumShift += oldIndex.getSegmentNum(newIndexStartTimeUs, periodDurationUs)
+            - newIndexFirstSegmentNum;
+      }
+    }
+
+    public int getSegmentNum(long positionUs) {
+      return segmentIndex.getSegmentNum(positionUs - periodStartTimeUs, periodDurationUs)
+          + segmentNumShift;
+    }
+
+    public long getSegmentStartTimeUs(int segmentNum) {
+      return segmentIndex.getTimeUs(segmentNum - segmentNumShift) + periodStartTimeUs;
+    }
+
+    public long getSegmentEndTimeUs(int segmentNum) {
+      return getSegmentStartTimeUs(segmentNum)
+          + segmentIndex.getDurationUs(segmentNum - segmentNumShift, periodDurationUs);
+    }
+
+    public boolean isLastSegment(int segmentNum) {
+      int lastSegmentNum = segmentIndex.getLastSegmentNum(periodDurationUs);
+      return lastSegmentNum == DashSegmentIndex.INDEX_UNBOUNDED ? false
+          : segmentNum == (lastSegmentNum + segmentNumShift);
+    }
+
+    public int getFirstAvailableSegmentNum() {
+      return segmentIndex.getFirstSegmentNum() + segmentNumShift;
+    }
+
+    public RangedUri getSegmentUrl(int segmentNum) {
+      return segmentIndex.getSegmentUrl(segmentNum - segmentNumShift);
+    }
+
+  }
+
+  private static final class PeriodHolder {
+
+    public final int localIndex;
+    public final long startTimeUs;
+    public final HashMap<String, RepresentationHolder> representationHolders;
+
+    private final int[] representationIndices;
+
+    private DrmInitData drmInitData;
+
+    private boolean indexIsUnbounded;
+    private boolean indexIsExplicit;
+    private long availableStartTimeUs;
+    private long availableEndTimeUs;
+
+    public PeriodHolder(int localIndex, MediaPresentationDescription manifest, int manifestIndex,
+        ExposedTrack selectedTrack) {
+      this.localIndex = localIndex;
+
+      Period period = manifest.getPeriod(manifestIndex);
+      long periodDurationUs = getPeriodDurationUs(manifest, manifestIndex);
+      AdaptationSet adaptationSet = period.adaptationSets.get(selectedTrack.adaptationSetIndex);
+      List<Representation> representations = adaptationSet.representations;
+
+      startTimeUs = period.startMs * 1000;
+      drmInitData = getDrmInitData(adaptationSet);
+
+      if (!selectedTrack.isAdaptive()) {
+        representationIndices = new int[] {
+            getRepresentationIndex(representations, selectedTrack.fixedFormat.id)};
+      } else {
+        representationIndices = new int[selectedTrack.adaptiveFormats.length];
+        for (int j = 0; j < selectedTrack.adaptiveFormats.length; j++) {
+          representationIndices[j] = getRepresentationIndex(
+              representations, selectedTrack.adaptiveFormats[j].id);
+        }
+      }
+
+      representationHolders = new HashMap<>();
+      for (int i = 0; i < representationIndices.length; i++) {
+        Representation representation = representations.get(representationIndices[i]);
+        RepresentationHolder representationHolder = new RepresentationHolder(startTimeUs,
+            periodDurationUs, representation);
+        representationHolders.put(representation.format.id, representationHolder);
+      }
+      updateRepresentationIndependentProperties(periodDurationUs,
+          representations.get(representationIndices[0]));
+    }
+
+    public void updatePeriod(MediaPresentationDescription manifest, int manifestIndex,
+        ExposedTrack selectedTrack) throws BehindLiveWindowException {
+      Period period = manifest.getPeriod(manifestIndex);
+      long periodDurationUs = getPeriodDurationUs(manifest, manifestIndex);
+      List<Representation> representations = period.adaptationSets
+          .get(selectedTrack.adaptationSetIndex).representations;
+
+      for (int j = 0; j < representationIndices.length; j++) {
+        Representation representation = representations.get(representationIndices[j]);
+        representationHolders.get(representation.format.id).updateRepresentation(periodDurationUs,
+            representation);
+      }
+      updateRepresentationIndependentProperties(periodDurationUs,
+          representations.get(representationIndices[0]));
+    }
+
+    public long getAvailableStartTimeUs() {
+      return availableStartTimeUs;
+    }
+
+    public long getAvailableEndTimeUs() {
+      if (isIndexUnbounded()) {
+        throw new IllegalStateException("Period has unbounded index");
+      }
+      return availableEndTimeUs;
+    }
+
+    public boolean isIndexUnbounded() {
+      return indexIsUnbounded;
+    }
+
+    public boolean isIndexExplicit() {
+      return indexIsExplicit;
+    }
+
+    // Private methods.
+
+    private void updateRepresentationIndependentProperties(long periodDurationUs,
+        Representation arbitaryRepresentation) {
+      DashSegmentIndex segmentIndex = arbitaryRepresentation.getIndex();
+      if (segmentIndex != null) {
+        int firstSegmentNum = segmentIndex.getFirstSegmentNum();
+        int lastSegmentNum = segmentIndex.getLastSegmentNum(periodDurationUs);
+        indexIsUnbounded = lastSegmentNum == DashSegmentIndex.INDEX_UNBOUNDED;
+        indexIsExplicit = segmentIndex.isExplicit();
+        availableStartTimeUs = startTimeUs + segmentIndex.getTimeUs(firstSegmentNum);
+        if (!indexIsUnbounded) {
+          availableEndTimeUs = startTimeUs + segmentIndex.getTimeUs(lastSegmentNum)
+              + segmentIndex.getDurationUs(lastSegmentNum, periodDurationUs);
+        }
+      } else {
+        indexIsUnbounded = false;
+        indexIsExplicit = true;
+        availableStartTimeUs = startTimeUs;
+        availableEndTimeUs = startTimeUs + periodDurationUs;
+      }
+    }
+
+    private static int getRepresentationIndex(List<Representation> representations,
+        String formatId) {
+      for (int i = 0; i < representations.size(); i++) {
+        Representation representation = representations.get(i);
+        if (formatId.equals(representation.format.id)) {
+          return i;
+        }
+      }
+      throw new IllegalStateException("Missing format id: " + formatId);
+    }
+
+    private static DrmInitData getDrmInitData(AdaptationSet adaptationSet) {
+      String drmInitMimeType = mimeTypeIsWebm(adaptationSet.representations.get(0).format.mimeType)
+          ? MimeTypes.VIDEO_WEBM : MimeTypes.VIDEO_MP4;
+      if (adaptationSet.contentProtections.isEmpty()) {
+        return null;
+      } else {
+        DrmInitData.Mapped drmInitData = null;
+        for (int i = 0; i < adaptationSet.contentProtections.size(); i++) {
+          ContentProtection contentProtection = adaptationSet.contentProtections.get(i);
+          if (contentProtection.uuid != null && contentProtection.data != null) {
+            if (drmInitData == null) {
+              drmInitData = new DrmInitData.Mapped(drmInitMimeType);
+            }
+            drmInitData.put(contentProtection.uuid, contentProtection.data);
+          }
+        }
+        return drmInitData;
+      }
+    }
+
+    private static long getPeriodDurationUs(MediaPresentationDescription manifest, int index) {
+      long durationMs = manifest.getPeriodDuration(index);
+      if (durationMs == -1) {
+        return C.UNKNOWN_TIME_US;
+      } else {
+        return durationMs * 1000;
+      }
     }
 
   }

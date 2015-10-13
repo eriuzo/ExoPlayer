@@ -15,8 +15,13 @@
  */
 package com.google.android.exoplayer.text.ttml;
 
+import com.google.android.exoplayer.text.Cue;
 import com.google.android.exoplayer.text.Subtitle;
 import com.google.android.exoplayer.util.Util;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 
 /**
  * A representation of a TTML subtitle.
@@ -24,23 +29,19 @@ import com.google.android.exoplayer.util.Util;
 public final class TtmlSubtitle implements Subtitle {
 
   private final TtmlNode root;
-  private final long startTimeUs;
   private final long[] eventTimesUs;
+  private final Map<String, TtmlStyle> globalStyles;
 
-  public TtmlSubtitle(TtmlNode root, long startTimeUs) {
+  public TtmlSubtitle(TtmlNode root, Map<String, TtmlStyle> globalStyles) {
     this.root = root;
-    this.startTimeUs = startTimeUs;
+    this.globalStyles = globalStyles != null
+        ? Collections.unmodifiableMap(globalStyles) : Collections.<String, TtmlStyle>emptyMap();
     this.eventTimesUs = root.getEventTimesUs();
   }
 
   @Override
-  public long getStartTime() {
-    return startTimeUs;
-  }
-
-  @Override
   public int getNextEventTimeIndex(long timeUs) {
-    int index = Util.binarySearchCeil(eventTimesUs, timeUs - startTimeUs, false, false);
+    int index = Util.binarySearchCeil(eventTimesUs, timeUs, false, false);
     return index < eventTimesUs.length ? index : -1;
   }
 
@@ -51,17 +52,32 @@ public final class TtmlSubtitle implements Subtitle {
 
   @Override
   public long getEventTime(int index) {
-    return eventTimesUs[index] + startTimeUs;
+    return eventTimesUs[index];
   }
 
   @Override
   public long getLastEventTime() {
-    return (eventTimesUs.length == 0 ? -1 : eventTimesUs[eventTimesUs.length - 1]) + startTimeUs;
+    return (eventTimesUs.length == 0 ? -1 : eventTimesUs[eventTimesUs.length - 1]);
+  }
+
+  /* @VisibleForTesting */
+  /* package */ TtmlNode getRoot() {
+    return root;
   }
 
   @Override
-  public String getText(long timeUs) {
-    return root.getText(timeUs - startTimeUs);
+  public List<Cue> getCues(long timeUs) {
+    CharSequence cueText = root.getText(timeUs, globalStyles);
+    if (cueText == null) {
+      return Collections.<Cue>emptyList();
+    } else {
+      Cue cue = new Cue(cueText);
+      return Collections.singletonList(cue);
+    }
   }
 
+  /* @VisibleForTesting */
+  /* package */ Map<String, TtmlStyle> getGlobalStyles() {
+    return globalStyles;
+  }
 }

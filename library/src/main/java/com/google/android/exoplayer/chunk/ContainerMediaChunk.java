@@ -16,137 +16,176 @@
 package com.google.android.exoplayer.chunk;
 
 import com.google.android.exoplayer.MediaFormat;
-import com.google.android.exoplayer.ParserException;
-import com.google.android.exoplayer.SampleHolder;
-import com.google.android.exoplayer.chunk.parser.Extractor;
+import com.google.android.exoplayer.chunk.ChunkExtractorWrapper.SingleTrackOutput;
+import com.google.android.exoplayer.drm.DrmInitData;
+import com.google.android.exoplayer.extractor.DefaultExtractorInput;
+import com.google.android.exoplayer.extractor.Extractor;
+import com.google.android.exoplayer.extractor.ExtractorInput;
+import com.google.android.exoplayer.extractor.SeekMap;
 import com.google.android.exoplayer.upstream.DataSource;
 import com.google.android.exoplayer.upstream.DataSpec;
-import com.google.android.exoplayer.upstream.NonBlockingInputStream;
-import com.google.android.exoplayer.util.Assertions;
+import com.google.android.exoplayer.util.ParsableByteArray;
+import com.google.android.exoplayer.util.Util;
 
-import java.util.Map;
-import java.util.UUID;
+import java.io.IOException;
 
 /**
- * A {@link MediaChunk} extracted from a container.
+ * A {@link BaseMediaChunk} that uses an {@link Extractor} to parse sample data.
  */
-public final class ContainerMediaChunk extends MediaChunk {
+public class ContainerMediaChunk extends BaseMediaChunk implements SingleTrackOutput {
 
-  private final Extractor extractor;
-  private final boolean maybeSelfContained;
+  private final ChunkExtractorWrapper extractorWrapper;
   private final long sampleOffsetUs;
+  private final int adaptiveMaxWidth;
+  private final int adaptiveMaxHeight;
 
-  private boolean prepared;
   private MediaFormat mediaFormat;
-  private Map<UUID, byte[]> psshInfo;
+  private DrmInitData drmInitData;
 
-  /**
-   * @deprecated Use the other constructor, passing null as {@code psshInfo}.
-   */
-  @Deprecated
-  public ContainerMediaChunk(DataSource dataSource, DataSpec dataSpec, Format format,
-      int trigger, long startTimeUs, long endTimeUs, int nextChunkIndex,
-      Extractor extractor, boolean maybeSelfContained, long sampleOffsetUs) {
-    this(dataSource, dataSpec, format, trigger, startTimeUs, endTimeUs, nextChunkIndex,
-        extractor, null, maybeSelfContained, sampleOffsetUs);
-  }
+  private volatile int bytesLoaded;
+  private volatile boolean loadCanceled;
 
   /**
    * @param dataSource A {@link DataSource} for loading the data.
    * @param dataSpec Defines the data to be loaded.
-   * @param format The format of the stream to which this chunk belongs.
    * @param trigger The reason for this chunk being selected.
+   * @param format The format of the stream to which this chunk belongs.
    * @param startTimeUs The start time of the media contained by the chunk, in microseconds.
    * @param endTimeUs The end time of the media contained by the chunk, in microseconds.
-   * @param nextChunkIndex The index of the next chunk, or -1 if this is the last chunk.
-   * @param extractor The extractor that will be used to extract the samples.
-   * @param psshInfo Pssh data. May be null if pssh data is present within the stream, meaning it
-   *     can be obtained directly from {@code extractor}, or if no pssh data is required.
-   * @param maybeSelfContained Set to true if this chunk might be self contained, meaning it might
-   *     contain a moov atom defining the media format of the chunk. This parameter can always be
-   *     safely set to true. Setting to false where the chunk is known to not be self contained may
-   *     improve startup latency.
-   * @param sampleOffsetUs An offset to subtract from the sample timestamps parsed by the extractor.
+   * @param chunkIndex The index of the chunk.
+   * @param sampleOffsetUs An offset to add to the sample timestamps parsed by the extractor.
+   * @param extractorWrapper A wrapped extractor to use for parsing the data.
+   * @param mediaFormat The {@link MediaFormat} of the chunk, if known. May be null if the data is
+   *     known to define its own format.
+   * @param adaptiveMaxWidth If this chunk contains video and is part of an adaptive playback, this
+   *     is the maximum width of the video in pixels that will be encountered during the playback.
+   *     {@link MediaFormat#NO_VALUE} otherwise.
+   * @param adaptiveMaxHeight If this chunk contains video and is part of an adaptive playback, this
+   *     is the maximum height of the video in pixels that will be encountered during the playback.
+   *     {@link MediaFormat#NO_VALUE} otherwise.
+   * @param drmInitData The {@link DrmInitData} for the chunk. Null if the media is not drm
+   *     protected. May also be null if the data is known to define its own initialization data.
+   * @param isMediaFormatFinal True if {@code mediaFormat} and {@code drmInitData} are known to be
+   *     correct and final. False if the data may define its own format or initialization data.
+   * @param parentId Identifier for a parent from which this chunk originates.
    */
-  public ContainerMediaChunk(DataSource dataSource, DataSpec dataSpec, Format format,
-      int trigger, long startTimeUs, long endTimeUs, int nextChunkIndex, Extractor extractor,
-      Map<UUID, byte[]> psshInfo, boolean maybeSelfContained, long sampleOffsetUs) {
-    super(dataSource, dataSpec, format, trigger, startTimeUs, endTimeUs, nextChunkIndex);
-    this.extractor = extractor;
-    this.maybeSelfContained = maybeSelfContained;
+  public ContainerMediaChunk(DataSource dataSource, DataSpec dataSpec, int trigger, Format format,
+      long startTimeUs, long endTimeUs, int chunkIndex, long sampleOffsetUs,
+      ChunkExtractorWrapper extractorWrapper, MediaFormat mediaFormat, int adaptiveMaxWidth,
+      int adaptiveMaxHeight, DrmInitData drmInitData, boolean isMediaFormatFinal, int parentId) {
+    super(dataSource, dataSpec, trigger, format, startTimeUs, endTimeUs, chunkIndex,
+        isMediaFormatFinal, parentId);
+    this.extractorWrapper = extractorWrapper;
     this.sampleOffsetUs = sampleOffsetUs;
-    this.psshInfo = psshInfo;
+    this.adaptiveMaxWidth = adaptiveMaxWidth;
+    this.adaptiveMaxHeight = adaptiveMaxHeight;
+    this.mediaFormat = getAdjustedMediaFormat(mediaFormat, sampleOffsetUs, adaptiveMaxWidth,
+        adaptiveMaxHeight);
+    this.drmInitData = drmInitData;
   }
 
   @Override
-  public void seekToStart() {
-    extractor.seekTo(0, false);
-    resetReadPosition();
+  public final long bytesLoaded() {
+    return bytesLoaded;
   }
 
   @Override
-  public boolean seekTo(long positionUs, boolean allowNoop) {
-    long seekTimeUs = positionUs + sampleOffsetUs;
-    boolean isDiscontinuous = extractor.seekTo(seekTimeUs, allowNoop);
-    if (isDiscontinuous) {
-      resetReadPosition();
-    }
-    return isDiscontinuous;
-  }
-
-  @Override
-  public boolean prepare() throws ParserException {
-    if (!prepared) {
-      if (maybeSelfContained) {
-        // Read up to the first sample. Once we're there, we know that the extractor must have
-        // parsed a moov atom if the chunk contains one.
-        NonBlockingInputStream inputStream = getNonBlockingInputStream();
-        Assertions.checkState(inputStream != null);
-        int result = extractor.read(inputStream, null);
-        prepared = (result & Extractor.RESULT_NEED_SAMPLE_HOLDER) != 0;
-      } else {
-        // We know there isn't a moov atom. The extractor must have parsed one from a separate
-        // initialization chunk.
-        prepared = true;
-      }
-      if (prepared) {
-        mediaFormat = extractor.getFormat();
-        Map<UUID, byte[]> extractorPsshInfo = extractor.getPsshInfo();
-        if (extractorPsshInfo != null) {
-          psshInfo = extractorPsshInfo;
-        }
-      }
-    }
-    return prepared;
-  }
-
-  @Override
-  public boolean sampleAvailable() throws ParserException {
-    NonBlockingInputStream inputStream = getNonBlockingInputStream();
-    int result = extractor.read(inputStream, null);
-    return (result & Extractor.RESULT_NEED_SAMPLE_HOLDER) != 0;
-  }
-
-  @Override
-  public boolean read(SampleHolder holder) throws ParserException {
-    NonBlockingInputStream inputStream = getNonBlockingInputStream();
-    Assertions.checkState(inputStream != null);
-    int result = extractor.read(inputStream, holder);
-    boolean sampleRead = (result & Extractor.RESULT_READ_SAMPLE) != 0;
-    if (sampleRead) {
-      holder.timeUs -= sampleOffsetUs;
-    }
-    return sampleRead;
-  }
-
-  @Override
-  public MediaFormat getMediaFormat() {
+  public final MediaFormat getMediaFormat() {
     return mediaFormat;
   }
 
   @Override
-  public Map<UUID, byte[]> getPsshInfo() {
-    return psshInfo;
+  public final DrmInitData getDrmInitData() {
+    return drmInitData;
+  }
+
+  // SingleTrackOutput implementation.
+
+  @Override
+  public final void seekMap(SeekMap seekMap) {
+    // Do nothing.
+  }
+
+  @Override
+  public final void drmInitData(DrmInitData drmInitData) {
+    this.drmInitData = drmInitData;
+  }
+
+  @Override
+  public final void format(MediaFormat mediaFormat) {
+    this.mediaFormat = getAdjustedMediaFormat(mediaFormat, sampleOffsetUs, adaptiveMaxWidth,
+        adaptiveMaxHeight);
+  }
+
+  @Override
+  public final int sampleData(ExtractorInput input, int length, boolean allowEndOfInput)
+      throws IOException, InterruptedException {
+    return getOutput().sampleData(input, length, allowEndOfInput);
+  }
+
+  @Override
+  public final void sampleData(ParsableByteArray data, int length) {
+    getOutput().sampleData(data, length);
+  }
+
+  @Override
+  public final void sampleMetadata(long timeUs, int flags, int size, int offset,
+      byte[] encryptionKey) {
+    getOutput().sampleMetadata(timeUs + sampleOffsetUs, flags, size, offset, encryptionKey);
+  }
+
+  // Loadable implementation.
+
+  @Override
+  public final void cancelLoad() {
+    loadCanceled = true;
+  }
+
+  @Override
+  public final boolean isLoadCanceled() {
+    return loadCanceled;
+  }
+
+  @SuppressWarnings("NonAtomicVolatileUpdate")
+  @Override
+  public final void load() throws IOException, InterruptedException {
+    DataSpec loadDataSpec = Util.getRemainderDataSpec(dataSpec, bytesLoaded);
+    try {
+      // Create and open the input.
+      ExtractorInput input = new DefaultExtractorInput(dataSource,
+          loadDataSpec.absoluteStreamPosition, dataSource.open(loadDataSpec));
+      if (bytesLoaded == 0) {
+        // Set the target to ourselves.
+        extractorWrapper.init(this);
+      }
+      // Load and parse the initialization data.
+      try {
+        int result = Extractor.RESULT_CONTINUE;
+        while (result == Extractor.RESULT_CONTINUE && !loadCanceled) {
+          result = extractorWrapper.read(input);
+        }
+      } finally {
+        bytesLoaded = (int) (input.getPosition() - dataSpec.absoluteStreamPosition);
+      }
+    } finally {
+      dataSource.close();
+    }
+  }
+
+  // Private methods.
+
+  private static MediaFormat getAdjustedMediaFormat(MediaFormat format, long sampleOffsetUs,
+      int adaptiveMaxWidth, int adaptiveMaxHeight) {
+    if (format == null) {
+      return null;
+    }
+    if (sampleOffsetUs != 0 && format.subsampleOffsetUs != MediaFormat.OFFSET_SAMPLE_RELATIVE) {
+      format = format.copyWithSubsampleOffsetUs(format.subsampleOffsetUs + sampleOffsetUs);
+    }
+    if (adaptiveMaxWidth != MediaFormat.NO_VALUE || adaptiveMaxHeight != MediaFormat.NO_VALUE) {
+      format = format.copyWithMaxVideoDimensions(adaptiveMaxWidth, adaptiveMaxHeight);
+    }
+    return format;
   }
 
 }

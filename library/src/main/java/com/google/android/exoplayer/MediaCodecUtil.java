@@ -15,6 +15,7 @@
  */
 package com.google.android.exoplayer;
 
+import com.google.android.exoplayer.util.Assertions;
 import com.google.android.exoplayer.util.MimeTypes;
 import com.google.android.exoplayer.util.Util;
 
@@ -27,13 +28,14 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
 
+import java.io.IOException;
 import java.util.HashMap;
 
 /**
  * A utility class for querying the available codecs.
  */
 @TargetApi(16)
-public class MediaCodecUtil {
+public final class MediaCodecUtil {
 
   /**
    * Thrown when an error occurs querying the device for its underlying media capabilities.
@@ -41,7 +43,7 @@ public class MediaCodecUtil {
    * Such failures are not expected in normal operation and are normally temporary (e.g. if the
    * mediaserver process has crashed and is yet to restart).
    */
-  public static class DecoderQueryException extends Exception {
+  public static class DecoderQueryException extends IOException {
 
     private DecoderQueryException(Throwable cause) {
       super("Failed to query underlying media codecs", cause);
@@ -51,8 +53,9 @@ public class MediaCodecUtil {
 
   private static final String TAG = "MediaCodecUtil";
 
-  private static final HashMap<CodecKey, Pair<String, CodecCapabilities>> codecs =
-      new HashMap<CodecKey, Pair<String, CodecCapabilities>>();
+  private static final HashMap<CodecKey, Pair<String, CodecCapabilities>> codecs = new HashMap<>();
+
+  private MediaCodecUtil() {}
 
   /**
    * Get information about the decoder that will be used for a given mime type.
@@ -134,8 +137,7 @@ public class MediaCodecUtil {
     for (int i = 0; i < numberOfCodecs; i++) {
       MediaCodecInfo info = mediaCodecList.getCodecInfoAt(i);
       String codecName = info.getName();
-      if (!info.isEncoder() && codecName.startsWith("OMX.")
-          && (secureDecodersExplicit || !codecName.endsWith(".secure"))) {
+      if (isCodecUsableDecoder(info, codecName, secureDecodersExplicit)) {
         String[] supportedTypes = info.getSupportedTypes();
         for (int j = 0; j < supportedTypes.length; j++) {
           String supportedType = supportedTypes[j];
@@ -166,6 +168,49 @@ public class MediaCodecUtil {
     return null;
   }
 
+  /**
+   * Returns whether the specified codec is usable for decoding on the current device.
+   */
+  private static boolean isCodecUsableDecoder(MediaCodecInfo info, String name,
+      boolean secureDecodersExplicit) {
+    if (info.isEncoder() || (!secureDecodersExplicit && name.endsWith(".secure"))) {
+      return false;
+    }
+
+    // Work around an issue where creating a particular MP3 decoder on some devices on platform API
+    // version 16 crashes mediaserver.
+    if (Util.SDK_INT == 16
+        && "OMX.qcom.audio.decoder.mp3".equals(name)
+        && ("dlxu".equals(Util.DEVICE) // HTC Butterfly
+            || "protou".equals(Util.DEVICE) // HTC Desire X
+            || "C6602".equals(Util.DEVICE) // Sony Xperia Z
+            || "C6603".equals(Util.DEVICE)
+            || "C6606".equals(Util.DEVICE)
+            || "C6616".equals(Util.DEVICE)
+            || "L36h".equals(Util.DEVICE)
+            || "SO-02E".equals(Util.DEVICE))) {
+      return false;
+    }
+
+    // Work around an issue where large timestamps are not propagated correctly.
+    if (Util.SDK_INT == 16
+        && "OMX.qcom.audio.decoder.aac".equals(name)
+        && ("C1504".equals(Util.DEVICE) // Sony Xperia E
+            || "C1505".equals(Util.DEVICE)
+            || "C1604".equals(Util.DEVICE) // Sony Xperia E dual
+            || "C1605".equals(Util.DEVICE))) {
+      return false;
+    }
+
+    // Work around an issue where the VP8 decoder on Samsung Galaxy S4 Mini does not render video.
+    if (Util.SDK_INT <= 19 && Util.DEVICE != null && Util.DEVICE.startsWith("serrano")
+        && "samsung".equals(Util.MANUFACTURER) && name.equals("OMX.SEC.vp8.dec")) {
+      return false;
+    }
+
+    return true;
+  }
+
   private static boolean isAdaptive(CodecCapabilities capabilities) {
     if (Util.SDK_INT >= 19) {
       return isAdaptiveV19(capabilities);
@@ -177,6 +222,33 @@ public class MediaCodecUtil {
   @TargetApi(19)
   private static boolean isAdaptiveV19(CodecCapabilities capabilities) {
     return capabilities.isFeatureSupported(CodecCapabilities.FEATURE_AdaptivePlayback);
+  }
+
+  /**
+   * Tests whether the device advertises it can decode video of a given type at a specified
+   * width, height, and frame rate.
+   * <p>
+   * Must not be called if the device SDK version is less than 21.
+   *
+   * @param mimeType The mime type.
+   * @param secure Whether the decoder is required to support secure decryption. Always pass false
+   *     unless secure decryption really is required.
+   * @param width Width in pixels.
+   * @param height Height in pixels.
+   * @param frameRate Frame rate in frames per second.
+   * @return Whether the decoder advertises support of the given size and frame rate.
+   */
+  @TargetApi(21)
+  public static boolean isSizeAndRateSupportedV21(String mimeType, boolean secure,
+      int width, int height, double frameRate) throws DecoderQueryException {
+    Assertions.checkState(Util.SDK_INT >= 21);
+    Pair<String, CodecCapabilities> info = getMediaCodecInfo(mimeType, secure);
+    if (info == null) {
+      return false;
+    }
+    MediaCodecInfo.VideoCapabilities videoCapabilities = info.second.getVideoCapabilities();
+    return videoCapabilities != null
+        && videoCapabilities.areSizeAndRateSupported(width, height, frameRate);
   }
 
   /**
