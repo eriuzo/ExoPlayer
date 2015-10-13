@@ -1,3 +1,5 @@
+import com.android.builder.core.BuilderConstants
+
 // Copyright (C) 2014 The Android Open Source Project
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,11 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 apply plugin: 'com.android.library'
-apply plugin: 'bintray-release'
 
 android {
     compileSdkVersion 22
-    buildToolsVersion "22.0.1"
+    buildToolsVersion "23.0.1"
 
     defaultConfig {
         // Important: ExoPlayerLib specifies a minSdkVersion of 9 because
@@ -48,7 +49,7 @@ dependencies {
 
 android.libraryVariants.all { variant ->
     def name = variant.buildType.name
-    if (name.equals(com.android.builder.core.BuilderConstants.DEBUG)) {
+    if (name.equals(BuilderConstants.DEBUG)) {
         return; // Skip debug builds.
     }
     def task = project.tasks.create "jar${name.capitalize()}", Jar
@@ -65,19 +66,9 @@ android.libraryVariants.all { variant ->
         classpath = files(variant.javaCompile.classpath.files, project.android.getBootClasspath())
         options {
             links "http://docs.oracle.com/javase/7/docs/api/"
-            linksOffline "https://developer.android.com/reference","${android.sdkDirectory}/docs/reference"
+            linksOffline "https://developer.android.com/reference", "${android.sdkDirectory}/docs/reference"
         }
         exclude '**/BuildConfig.java'
         exclude '**/R.java'
     }
-}
-
-publish {
-    repoName = 'exoplayer'
-    userOrg = 'google'
-    groupId = 'com.google.android.exoplayer'
-    artifactId = 'exoplayer'
-    version = 'r1.5.0'
-    description = 'The ExoPlayer library.'
-    website = 'https://github.com/google/ExoPlayer'
 }
